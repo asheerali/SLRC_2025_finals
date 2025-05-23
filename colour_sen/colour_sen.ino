@@ -1,7 +1,7 @@
-#define S0 27
-#define S2 26
-#define S3 29
-#define OUT 28
+#define S0 44
+#define S2 47
+#define S3 46
+#define OUT 49
 
 unsigned long redFreq, greenFreq, blueFreq;
 

@@ -1,8 +1,8 @@
 // TCS3200 (HW-067) required pin definitions
-#define S0 27  // Frequency scaling
-#define S2 26  // Filter select
-#define S3 29  // Filter select
-#define OUT 28 // Frequency output
+#define S0 44  // Frequency scaling
+#define S2 47  // Filter select
+#define S3 46  // Filter select
+#define OUT 49 // Frequency output
 
 
 unsigned long redFreq, greenFreq, blueFreq;

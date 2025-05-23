@@ -1,0 +1,59 @@
+Map for functions in Robo
+
+
+
+readSensors(sV)		-> above 80()--> 0 (black)
+*Updates the int sensorValues pointer object
+
+
+
+
+line_follow(sV)		-> check immediate turns
+					-> stops and use check_juction() to detect any juction
+			else--> PID_Linefollow()
+
+* Have to update sensorValues using readSensors() BEFORE use
+* can line follow and able to take immediate turns as well
+* check_juction_second has the junction updates (inside the check_juction())
+***** Haven't give any command to do in Juctions
+* check HOW TO USE in line_follow_juction_turns()
+
+
+
+line_follow_juction_turns()		########
+*External uses with junction commands
+
+calculatePID(sV)		-> no line-----> (-)previousError
+					-> else-> IR array PID
+					-> return pidValue
+* Have to MAKE THIS MORE ADVANCED----> LATER
+
+
+
+
+PID_Linefollow(pidValue)	<---- update the pidValue with calculatePID(sV)	####
+	-> lfspeed=200
+
+	motor_drive(left speed, right speed)	<--- speed can be negative or possitive
+
+* can line follow using IR array pid (don't prefer to take immediate turns)
+
+
+check_juction(count)<---- to get the junction readings 
+
+	-> go 15 encoderCount using moveStraightPID()
+	-> check the junction for sure using check_juction_second function
+	->  If no junction PID_Linefollow(pidValue)<-- update pidValue
+* can't use for external use
+
+
+check_juction_second(sV , count )
+
+* can't use for external use
+
+
+
+moveStraightPID
+
+
+calibrateColors() <---- for arm grabbing
