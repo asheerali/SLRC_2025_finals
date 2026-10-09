@@ -21,6 +21,7 @@ DEPTH_TOPIC = "wrist_rgbd/depth_image"   # depth gives the real height of each c
 OUTPUT_TOPIC = "wrist_rgbd/annotated"
 MAX_FPS = 10
 NO_FRAMES_WARNING_S = 5.0   # warn if the camera topic stays silent this long
+PRINT_STABLE_FRAMES = 8     # log the cap count only after it has stayed the same this many frames
 
 # ---------------- YOLO detection (optional) ----------------
 # Set YOLO_MODEL_PATH to your trained .pt file to detect with YOLO instead of colour ranges.
@@ -72,6 +73,8 @@ RELEASE_PULL_IN_M = (0.0, 0.04, 0.08, 0.12)   # if the box centre is out of reac
 RELEASE_NEAR_BOX_M = 0.12    # if the gripper is this close to the box centre (sideways), just drop the cap
 CAP_MERGE_M = 0.03           # cap sightings closer than this are the same cap
 CAP_SCAN_S = 2.0             # watch the caps this long before picking
+MAX_ROUNDS = 20              # safety limit on detect-pick-drop rounds
+MAX_ATTEMPTS_PER_CAP = 2     # if the same cap is still there after this many picks, give up on it
 CAP_IGNORE_NEAR_BOX_M = 0.12 # a cap this close to a box is already sorted; do not pick it again
 PLANNING_TIMEOUT_S = 2.0   # per attempt; unreachable poses fail fast
 SETTLE_S = 0.5
@@ -290,6 +293,7 @@ class BoxMemory:
 
     def __init__(self):
         self.boxes = []   # {"bearing": rad, "joint1": rad, "pixel": (x, y)}
+        self.action = ""  # what the robot is doing now; drawn on the annotated frame
 
     def add(self, boxes, rgb, joint1, locate):
         width = rgb.array.shape[1]
@@ -318,45 +322,78 @@ class BoxMemory:
         return {"left": left, "right": right}
 
 
-def pump_frames(frames, errors, publisher, memory, loop, seconds=None):
-    """Detect and publish annotated frames for `seconds` (forever if None).
+class LiveDetector(threading.Thread):
+    """Detect and publish annotated frames continuously in the background.
 
-    Returns (caps, boxes, rgb) from the last frame processed (rgb is None if none arrived).
+    The annotated view therefore stays live while the arm moves, picks and drops.
     """
-    end = None if seconds is None else time.monotonic() + seconds
-    last = ([], [], None)
-    while end is None or time.monotonic() < end:
+
+    def __init__(self, frames, errors, publisher, memory):
+        super().__init__(daemon=True)
+        self.frames = frames
+        self.errors = errors
+        self.publisher = publisher
+        self.memory = memory
+        self.latest = ([], [], None, 0.0)   # caps, boxes, rgb, time it was processed
+        self.failure = None
+        self.last_frame_time = time.monotonic()
+
+    def run(self):
+        next_frame = 0.0
+        last_count = None
+        candidate = None
+        stable = 0
         try:
-            message = frames.get(timeout=0.1)
-        except queue.Empty:
-            if not errors.empty():
-                raise errors.get()
-            if not loop["warned"] and time.monotonic() - loop["last_frame_time"] > NO_FRAMES_WARNING_S:
+            while True:
+                try:
+                    message = self.frames.get(timeout=0.1)
+                except queue.Empty:
+                    if not self.errors.empty():
+                        raise self.errors.get()
+                    continue
+                self.last_frame_time = time.monotonic()
+                if self.last_frame_time < next_frame:
+                    continue
+                next_frame = self.last_frame_time + 1 / MAX_FPS
+
+                rgb = compressed_message_to_frame(message)
+                caps, boxes = detect_caps_and_boxes(rgb.array)
+                self.latest = (caps, boxes, rgb, time.monotonic())
+                # Print only when the cap count has stayed the same for a few frames, so a flickering
+                # camera does not flood the log with "N cap(s)" lines.
+                count = len(caps)
+                stable = stable + 1 if count == candidate else 1
+                candidate = count
+                if stable >= PRINT_STABLE_FRAMES and count != last_count:
+                    print(f"{count} cap(s)")
+                    for cap in caps:
+                        cx, cy = cap["centre"]
+                        print(f"  {cap['colour']} cap at ({cx:.0f}, {cy:.0f}) px -> "
+                              f"{CAP_DESTINATION[cap['colour']]} box")
+                    last_count = count
+                self.publisher.publish(annotate(rgb, caps, boxes, self.memory))
+        except Exception as exc:
+            self.failure = exc
+
+    def wait(self, seconds=None):
+        """Let the live view run for `seconds` (forever if None); return the latest (caps, boxes, rgb)."""
+        start = time.monotonic()
+        warned = False
+        while seconds is None or time.monotonic() - start < seconds:
+            if self.failure is not None:
+                raise self.failure
+            if not warned and time.monotonic() - self.last_frame_time > NO_FRAMES_WARNING_S:
                 print(f"WARNING: no frames on '{RGB_TOPIC}' for {NO_FRAMES_WARNING_S:.0f}s; "
                       "check the topic name.")
-                loop["warned"] = True
-            continue
-        loop["last_frame_time"] = time.monotonic()
-        loop["warned"] = False
-
-        now = time.monotonic()
-        if now < loop["next_frame"]:
-            continue
-        loop["next_frame"] = now + 1 / MAX_FPS
-
-        rgb = compressed_message_to_frame(message)
-        caps, boxes = detect_caps_and_boxes(rgb.array)
-        last = (caps, boxes, rgb)
-        state = len(caps)
-        if state != loop["last_count"]:
-            print(f"{len(caps)} cap(s)")
-            for cap in caps:
-                cx, cy = cap["centre"]
-                print(f"  {cap['colour']} cap at ({cx:.0f}, {cy:.0f}) px -> "
-                      f"{CAP_DESTINATION[cap['colour']]} box")
-            loop["last_count"] = state
-        publisher.publish(annotate(rgb, caps, boxes, memory))
-    return last
+                warned = True
+            time.sleep(0.1)
+        deadline = time.monotonic() + 3.0   # make sure the result is from after the wait began
+        while self.latest[3] < start and time.monotonic() < deadline:
+            if self.failure is not None:
+                raise self.failure
+            time.sleep(0.05)
+        caps, boxes, rgb, _ = self.latest
+        return caps, boxes, rgb
 
 
 def search_for_boxes(arm, memory, pump, locate):
@@ -368,6 +405,7 @@ def search_for_boxes(arm, memory, pump, locate):
         if time.monotonic() - start >= SEARCH_MAX_S:
             print(f"Search time limit ({SEARCH_MAX_S:.0f} s) reached")
             break
+        memory.action = f"searching for boxes (joint1 {angle:+.2f})"
         target = {**DETECTION_JOINTS, "joint1": angle}
         try:
             move_to(arm, target, f"search window (joint1 {angle:+.2f})")
@@ -399,6 +437,9 @@ def annotate(rgb: Image, caps, boxes, memory) -> Image:
     status = "boxes saved" if memory.saved else f"{len(memory.boxes)} box(es) found"
     cv2.putText(canvas, f"{len(caps)} cap(s) | {status}", (8, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+    if memory.action:
+        cv2.putText(canvas, memory.action, (8, 44),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2, cv2.LINE_AA)
     return Image(array=canvas, encoding="bgr8", header=rgb.header)
 
 
@@ -793,51 +834,82 @@ def describe_arm(arm):
 
 
 def sort_caps(arm, memory, pump, locate):
-    """Pick every blue cap into the left box, then every green cap into the right box.
+    """Sort every cap: each round goes to the detection pose, detects and saves the cap positions,
+    picks one cap from above, drops it in its box and comes back. Stops when no cap is left.
 
-    After every drop (or failed pick) the arm goes back to the detection pose and looks again,
-    so each cap is found from a fresh view and the arm never drives straight from a box to a cap.
+    pink -> left box, green -> right box (see CAP_DESTINATION). The arm never drives straight from a
+    box to the next cap: it always returns to the detection pose and looks again first.
     """
     describe_arm(arm)
     boxes = memory.saved
-    plan = (("blue", boxes["left"], "left"), ("green", boxes["right"], "right"))
+    destination_box = {colour: boxes[side] for colour, side in CAP_DESTINATION.items()}
     box_points = [box["position"] for box in boxes.values() if box["position"] is not None]
     moved = skipped = 0
-    failed = []   # positions of caps that could not be picked; ignored from then on
+    failed = []     # positions of caps that could not be sorted; ignored from then on
+    attempts = []   # [position, tries] so one stubborn cap cannot be picked forever
+
+    def near(a, b, radius):
+        return math.hypot(a.x - b.x, a.y - b.y) < radius
 
     def is_ignored(point):
-        near_box = any(math.hypot(point.x - b.x, point.y - b.y) < CAP_IGNORE_NEAR_BOX_M for b in box_points)
-        return near_box or any(math.hypot(point.x - f.x, point.y - f.y) < CAP_MERGE_M for f in failed)
+        # a cap next to a box is already sorted; a failed cap is skipped
+        return any(near(point, b, CAP_IGNORE_NEAR_BOX_M) for b in box_points) or any(
+            near(point, f, CAP_MERGE_M) for f in failed)
 
-    for colour, box, side in plan:
-        target = box["position"]
+    for round_number in range(1, MAX_ROUNDS + 1):
+        memory.action = "looking for caps"
+        move_to(arm, DETECTION_JOINTS, "detection")
+        caps, _boxes, rgb = pump(CAP_SCAN_S)
+        if rgb is None:
+            break
+        found = locate_caps(locate, rgb, caps)
+        todo = [(colour, point) for colour in CAP_DESTINATION for point in found[colour]
+                if not is_ignored(point)]
+        if not todo:
+            print("No more caps to pick: everything is sorted")
+            break
+
+        summary = ", ".join(f"{sum(1 for c, _ in todo if c == colour)} {colour}" for colour in CAP_DESTINATION)
+        print(f"Round {round_number}: saved the positions of {summary} cap(s)")
+        colour, point = todo[0]
+        side = CAP_DESTINATION[colour]
+        target = destination_box[colour]["position"]
         if target is None:
-            print(f"No 3D position for the {side} box; skipping {colour} caps")
+            print(f"No 3D position for the {side} box; skipping the {colour} cap at {fmt(point)}")
+            failed.append(point)
+            skipped += 1
             continue
-        while True:
-            move_to(arm, DETECTION_JOINTS, "detection")
-            caps, _boxes, rgb = pump(CAP_SCAN_S)
-            if rgb is None:
-                break
-            remaining = [p for p in locate_caps(locate, rgb, caps)[colour] if not is_ignored(p)]
-            if not remaining:
-                print(f"No more {colour} caps to pick")
-                break
-            point = remaining[0]
-            print(f"{colour} cap ({len(remaining)} left) at {fmt(point)} -> {side} box {fmt(target)}")
-            try:
-                grasp = pick_cap(arm, point)
-            except PickFailed as exc:
-                print(f"  skipped: {exc}")
+
+        entry = next((a for a in attempts if near(a[0], point, CAP_MERGE_M)), None)
+        if entry is None:
+            attempts.append([point, 1])
+        else:
+            entry[1] += 1
+            if entry[1] > MAX_ATTEMPTS_PER_CAP:
+                print(f"  the {colour} cap at {fmt(point)} is still there after {MAX_ATTEMPTS_PER_CAP} tries; ignoring it")
                 failed.append(point)
                 skipped += 1
                 continue
-            if release_cap(arm, target, grasp):
-                moved += 1
-            else:
-                put_back(arm, grasp)
-                failed.append(point)
-                skipped += 1
+
+        print(f"  {colour} cap at {fmt(point)} -> {side} box {fmt(target)}")
+        memory.action = f"picking {colour} cap"
+        try:
+            grasp = pick_cap(arm, point)
+        except PickFailed as exc:
+            print(f"  skipped: {exc}")
+            failed.append(point)
+            skipped += 1
+            continue
+        memory.action = f"carrying {colour} cap to the {side} box"
+        if release_cap(arm, target, grasp):
+            moved += 1
+        else:
+            put_back(arm, grasp)
+            failed.append(point)
+            skipped += 1
+    else:
+        print(f"Stopped after {MAX_ROUNDS} rounds")
+    memory.action = "sorting finished"
     print(f"Sorting finished: {moved} cap(s) moved, {skipped} skipped")
 
 
@@ -891,12 +963,12 @@ try:
                              daemon=True).start()
 
             memory = BoxMemory()
-            loop = {"next_frame": time.monotonic(), "last_count": None,
-                    "last_frame_time": time.monotonic(), "warned": False}
             print(f"Publishing annotated frames to {OUTPUT_TOPIC} - add it as a camera panel.")
+            detector = LiveDetector(frames, errors, publisher, memory)
+            detector.start()
 
             def pump(seconds=None):
-                return pump_frames(frames, errors, publisher, memory, loop, seconds)
+                return detector.wait(seconds)
 
             depth_warned = []
 

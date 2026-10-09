@@ -1,6 +1,9 @@
-"""Find the round, colourless bottle caps at the detection position and stack one on top of another."""
+"""REAL ROBOT: find the pale round bottle caps by their colour boundary at the detection position and
+stack them on one base cap. Keep the emergency stop within reach (rules.md.txt, Rule 5)."""
 
 import math
+import queue
+import threading
 import time
 from dataclasses import dataclass
 
@@ -8,15 +11,19 @@ import cv2
 import numpy as np
 
 from olo import Client, OloError, OloTimeoutError, OloUnavailable
-from olo.core.images import Image
+from olo.core.images import Image, compressed_message_to_frame
 from olo.kinematics import JointTarget
 from olo.spatial import Point, Pose, Quaternion
 from olo.vision import Pixel, camera_info_to_intrinsics, deproject_to_frame, project, sample_depth_point
 
-RGB_TOPIC = "wrist_rgbd/image"
-CAMERA_INFO_TOPIC = "wrist_rgbd/camera_info"
-DEPTH_TOPIC = "wrist_rgbd/depth_image"   # depth gives the real height of each cap
-OUTPUT_TOPIC = "wrist_rgbd/annotated"    # add this as a camera panel: it shows what was found / rejected
+# Real robot camera topics (the simulation uses wrist_rgbd/...). CAMERA_INFO_TOPIC and DEPTH_TOPIC
+# are the names used in real_cap_color.py: check them in your topic list if they fail.
+RGB_TOPIC = "camera/color/image_raw/compressed"
+CAMERA_INFO_TOPIC = "camera/color/camera_info"
+DEPTH_TOPIC = "camera/depth/image_raw"   # raw depth; gives each cap's real height
+OUTPUT_TOPIC = "camera/annotated"        # add this as a camera panel: it shows what was found / rejected
+REQUIRE_DEPTH = True         # real robot: never guess heights; skip a cap if depth is unavailable
+ROTATE_IMAGE_180 = True      # the real camera is mounted upside down: flip the image upright first
 MAX_FPS = 10
 
 # ---------------- YOLO detection (optional) ----------------
@@ -25,16 +32,22 @@ YOLO_MODEL_PATH = None            # e.g. r"C:\models\bottle_caps.pt"
 YOLO_CONFIDENCE = 0.5
 YOLO_CAP_CLASSES = {"bottle_cap", "cap"}   # class names that mean "bottle cap"; None = every class
 
-# ---------------- Shape detection (used when YOLO_MODEL_PATH is None) ----------------
-# Caps are round and have no colour (grey / white / black): look for low-saturation blobs that are round.
-CAP_MAX_SATURATION = 70       # above this a pixel is "coloured" (the wooden table) and is ignored
-CAP_MIN_BRIGHTNESS = 40       # ignore very dark shadows
-CAP_MIN_AREA_PX = 200
-CAP_MAX_AREA_FRACTION = 0.15  # a blob bigger than this share of the image is background, not a cap
-CAP_MIN_ROUNDNESS = 0.6       # short axis / long axis of the fitted ellipse (oblique views look oval)
-CAP_MIN_FILL = 0.75           # blob area / fitted ellipse area
-CAP_WIDTH_M = 0.08            # simulator caps: 8 cm across
-CAP_WIDTH_TOLERANCE_M = 0.03  # accepted real size: width +- 3 cm (checked with the depth image)
+# ---------------- Cap detection by colour boundary (used when YOLO_MODEL_PATH is None) ----------------
+# The caps are PALE and shiny (cream / white) on a dark carpet, so their boundary is where the bright,
+# low-saturation pixels end. HSV: H 0-179, S/V 0-255. Tune under your lighting. The big white box is bigger
+# than MAX_CAP_AREA_PX and is ignored; the dark shadow ring round a cap is not part of the blob.
+CAP_HSV = [((0, 0, 150), (179, 90, 255))]   # list of (low, high) ranges, joined
+MIN_CAP_AREA_PX = 500         # smaller blobs are noise (a cap is ~1000 px in the detection view)
+MAX_CAP_AREA_PX = 4000        # bigger blobs are the white box / paper, not a cap
+CAP_MERGE_PX = 15             # close gaps this wide so a cap's top, rim and shiny highlight form one blob
+CAPS_SKIP_BORDER = True       # ignore blobs cut by the image edge (their centre would be wrong)
+CAP_MIN_ROUNDNESS = 0.6       # short axis / long axis of the fitted ellipse; caps are only "almost round"
+CAP_MIN_FILL = 0.75           # blob area / fitted ellipse area (lower = accepts rougher circles)
+# All caps are the same size: it is learned ONCE from the first group of similar blobs (or set it here).
+CAP_DIAMETER_PX = None        # fixed cap diameter in pixels, or None = learn it once while running
+CAP_SIZE_TOLERANCE = 0.25     # a blob must be within +-25% of the cap size
+CAP_CALIBRATE_MIN_COUNT = 2   # learn the size from at least this many round blobs of similar size
+CAP_WIDTH_M = None            # real cap width in metres, or None = do not check (the pixel size is enough)
 
 # ---------------- Stacking ----------------
 # TABLE_Z_M is only used if the depth image cannot be read. Cap height is real (2 cm in the simulator).
@@ -212,35 +225,81 @@ def load_yolo():
     return _yolo
 
 
+_cap_size = {"px": CAP_DIAMETER_PX}   # learned (or fixed) cap diameter in pixels
+
+
+def apply_size_filter(cands, rejected):
+    """Keep the candidates that match the cap size, learning the size once if it is not known yet.
+
+    cands are dicts with "diameter_px" and "bbox". Returns the accepted ones; the others go to `rejected`.
+    """
+    if _cap_size["px"] is None and cands:
+        best, best_score = [], 0.0
+        for c in cands:
+            group = [o for o in cands if abs(o["diameter_px"] - c["diameter_px"]) <= CAP_SIZE_TOLERANCE * c["diameter_px"]]
+            score = sum(o["area"] for o in group)   # real caps are a few big blobs; noise is many tiny ones
+            if len(group) >= CAP_CALIBRATE_MIN_COUNT and score > best_score:
+                best, best_score = group, score
+        if len(best) >= CAP_CALIBRATE_MIN_COUNT:
+            _cap_size["px"] = float(np.median([o["diameter_px"] for o in best]))
+            print(f"Cap size learned: {_cap_size['px']:.1f} px across (from {len(best)} round blobs). "
+                  "All caps must match it now.")
+    ref = _cap_size["px"]
+    if ref is None:
+        for c in cands:
+            rejected.append((c["bbox"], f"{c['diameter_px']:.0f}px, learning size"))
+        return []
+    kept = []
+    for c in cands:
+        if abs(c["diameter_px"] - ref) <= CAP_SIZE_TOLERANCE * ref:
+            kept.append(c)
+        else:
+            rejected.append((c["bbox"], f"size {c['diameter_px']:.0f}px != {ref:.0f}px"))
+    return kept
+
+
 def detect_with_yolo(bgr):
-    """Caps found by the YOLO model, as ([cap dicts], [])."""
+    """Caps found by the YOLO model, as ([cap dicts], [rejected]). The first detections set the cap size."""
     result = load_yolo()(bgr, conf=YOLO_CONFIDENCE, verbose=False)[0]
-    caps = []
+    cands, rejected = [], []
     for xyxy, cls in zip(result.boxes.xyxy.tolist(), result.boxes.cls.tolist()):
         if YOLO_CAP_CLASSES is not None and result.names[int(cls)] not in YOLO_CAP_CLASSES:
             continue
         x1, y1, x2, y2 = xyxy
         x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
-        caps.append({"centre": (x1 + w / 2, y1 + h / 2), "bbox": (x, y, w, h), "area": w * h})
-    return caps, []
+        cands.append({"centre": (x1 + w / 2, y1 + h / 2), "bbox": (x, y, w, h), "area": w * h,
+                      "diameter_px": (w + h) / 2.0})
+    if _cap_size["px"] is None and cands:   # YOLO is trusted: its first detection sets the size
+        _cap_size["px"] = float(np.median([c["diameter_px"] for c in cands]))
+        print(f"Cap size learned from YOLO: {_cap_size['px']:.1f} px across.")
+    return apply_size_filter(cands, rejected), rejected
 
 
 def detect_by_shape(bgr):
-    """Round, colourless blobs. Returns ([cap dicts], [rejected blobs as (bbox, reason)])."""
+    """Pale round blobs of the cap size, outlined by their colour boundary.
+
+    Returns ([cap dicts], [rejected blobs as (bbox, reason)]).
+    """
     height, width = bgr.shape[:2]
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    mask = ((hsv[..., 1] <= CAP_MAX_SATURATION) & (hsv[..., 2] >= CAP_MIN_BRIGHTNESS)).astype(np.uint8) * 255
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel), cv2.MORPH_CLOSE, kernel)
+    mask = np.zeros((height, width), np.uint8)
+    for low, high in CAP_HSV:
+        mask |= cv2.inRange(hsv, np.array(low, np.uint8), np.array(high, np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (CAP_MERGE_PX, CAP_MERGE_PX)))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    caps, rejected = [], []
+    cands, rejected = [], []
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < CAP_MIN_AREA_PX or len(cnt) < 5:
-            continue   # tiny specks: not worth drawing
+        if area < MIN_CAP_AREA_PX or len(cnt) < 5:
+            continue   # specks: not worth drawing
         x, y, w, h = cv2.boundingRect(cnt)
-        if area > CAP_MAX_AREA_FRACTION * width * height:
-            rejected.append(((x, y, w, h), "too big"))
+        if area > MAX_CAP_AREA_PX:
+            rejected.append(((x, y, w, h), "too big (box?)"))
+            continue
+        if CAPS_SKIP_BORDER and (x <= 2 or y <= 2 or x + w >= width - 2 or y + h >= height - 2):
+            rejected.append(((x, y, w, h), "cut by image edge"))
             continue
         (cx, cy), (ax1, ax2), _ = cv2.fitEllipse(cnt)
         long_ax, short_ax = max(ax1, ax2), min(ax1, ax2)
@@ -251,8 +310,9 @@ def detect_by_shape(bgr):
         if roundness < CAP_MIN_ROUNDNESS or fill < CAP_MIN_FILL:
             rejected.append(((x, y, w, h), f"not round {roundness:.2f}/{fill:.2f}"))
             continue
-        caps.append({"centre": (cx, cy), "bbox": (x, y, w, h), "area": area})
-    return caps, rejected
+        cands.append({"centre": (cx, cy), "bbox": (x, y, w, h), "area": area, "contour": cnt,
+                      "diameter_px": (long_ax + short_ax) / 2.0})
+    return apply_size_filter(cands, rejected), rejected
 
 
 def detect_caps(bgr):
@@ -260,56 +320,119 @@ def detect_caps(bgr):
     return detect_with_yolo(bgr) if YOLO_MODEL_PATH else detect_by_shape(bgr)
 
 
-def annotate(rgb: Image, caps, rejected) -> Image:
+def annotate(rgb: Image, caps, rejected, stage="", marks=()) -> Image:
     canvas = np.array(rgb.array() if callable(rgb.array) else rgb.array)
     for (x, y, w, h), reason in rejected:
         cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 0, 255), 1)
         cv2.putText(canvas, reason, (x, max(y - 4, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1, cv2.LINE_AA)
-    for cap in caps:
+    for n, cap in enumerate(caps, start=1):
         x, y, w, h = cap["bbox"]
-        cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 200, 0), 2)
-        cv2.putText(canvas, "cap", (x, max(y - 6, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 0), 1, cv2.LINE_AA)
-    cv2.putText(canvas, f"{len(caps)} cap(s) | {len(rejected)} rejected (red)", (8, 20),
+        cx, cy = cap["centre"]
+        if cap.get("contour") is not None:
+            cv2.polylines(canvas, [cap["contour"]], True, (0, 255, 0), 2, cv2.LINE_AA)   # the detected boundary
+        cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 160, 0), 1)
+        cv2.circle(canvas, (int(cx), int(cy)), 3, (0, 0, 255), -1)
+        cv2.putText(canvas, f"cap {n}", (x, max(y - 6, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+    for (cx, cy), text in marks:   # 3D positions measured at the detection position
+        cv2.putText(canvas, text, (int(cx) - 60, int(cy) + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(canvas, f"detection: {len(caps)} cap(s), {len(rejected)} rejected (red)", (8, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+    if stage:
+        cv2.putText(canvas, stage, (8, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1, cv2.LINE_AA)
     return Image(array=canvas, encoding="bgr8", header=rgb.header)
 
 
-def grab_bgr(robot, rgb_topic):
-    """Latest camera image as (Image, BGR array). Raw images may be RGB: convert so the colour code is right."""
-    img = robot.core.get_image(rgb_topic, timeout=3.0)
-    arr = np.asarray(img.array() if callable(img.array) else img.array)[..., :3].astype(np.uint8)
-    if "bgr" not in str(getattr(img, "encoding", "rgb8")).lower():
-        arr = np.ascontiguousarray(arr[..., ::-1])
-    return img, arr
+def receive_latest(robot, topic, frames, errors):
+    """Keep only the newest camera message in `frames`."""
+    try:
+        with robot.core.subscribe(topic) as sub:
+            for message in sub:
+                try:
+                    frames.get_nowait()
+                except queue.Empty:
+                    pass
+                frames.put_nowait(message)
+    except Exception as error:
+        errors.put(error)
 
 
-def pump_frames(grab, publisher, loop, seconds):
-    """Detect and publish annotated frames for `seconds`.
+def grab_frame(frames, errors):
+    """Next camera frame as (upright Image, BGR array); the real camera is mounted upside down."""
+    try:
+        message = frames.get(timeout=3.0)
+    except queue.Empty:
+        if not errors.empty():
+            raise errors.get()
+        raise RuntimeError(f"no frames on '{RGB_TOPIC}' for 3 s; check the topic name")
+    rgb = compressed_message_to_frame(message)
+    array = np.asarray(rgb.array)
+    if ROTATE_IMAGE_180:
+        array = cv2.rotate(array, cv2.ROTATE_180)
+    array = np.ascontiguousarray(array[..., :3])
+    return Image(array=array, encoding=rgb.encoding, header=rgb.header), array
 
-    Returns (caps, bgr_image, rgb) from the last frame processed (rgb is None if no frame could be read).
-    """
-    end = time.monotonic() + seconds
-    last = ([], None, None)
-    while time.monotonic() < end:
-        try:
-            img, bgr = grab()
-        except Exception as exc:
-            print(f"Could not read a camera frame: {exc}")
-            time.sleep(0.5)
-            continue
-        caps, rejected = detect_caps(bgr)
-        last = (caps, bgr, img)
-        state = (len(caps), tuple(reason for _, reason in rejected))
-        if state != loop["last_state"]:
-            print(f"{len(caps)} cap(s) found, {len(rejected)} blob(s) rejected: "
-                  f"{[reason for _, reason in rejected] or 'none'}")
-            loop["last_state"] = state
-        try:
-            publisher.publish(annotate(Image(array=bgr, encoding="bgr8", header=img.header), caps, rejected))
-        except Exception as exc:
-            print(f"Could not publish the annotated frame: {exc}")
-        time.sleep(1 / MAX_FPS)
-    return last
+
+class LiveView:
+    """Publishes the annotated camera image the whole run. Caps are detected ONLY during look(): that
+    result is recorded and then frozen on the image, so nothing is re-detected while the arm works."""
+
+    def __init__(self, grab, publisher):
+        self.grab = grab
+        self.publisher = publisher
+        self.lock = threading.Lock()
+        self.detecting = False
+        self.latest = ([], [], None)     # caps, rejected, raw image (newest detection)
+        self.frozen = ([], [])           # caps, rejected recorded by look()
+        self.stage = "starting"
+        self.marks = []                  # [((px, py), text)] drawn on the image
+        self.stop = threading.Event()
+        self.last_error = None
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def run(self):
+        while not self.stop.is_set():
+            try:
+                img, bgr = self.grab()
+            except Exception as exc:
+                if str(exc) != self.last_error:
+                    print(f"Could not read a camera frame: {exc}")
+                    self.last_error = str(exc)
+                self.stop.wait(0.5)
+                continue
+            self.last_error = None
+            if self.detecting:
+                caps, rejected = detect_caps(bgr)
+                with self.lock:
+                    if self.detecting:
+                        self.latest = (caps, rejected, img)
+            with self.lock:
+                caps, rejected = self.frozen if not self.detecting else self.latest[:2]
+                stage, marks = self.stage, list(self.marks)
+            try:
+                self.publisher.publish(annotate(Image(array=bgr, encoding="bgr8", header=img.header),
+                                                caps, rejected, stage, marks))
+            except Exception as exc:
+                print(f"Could not publish the annotated frame: {exc}")
+            self.stop.wait(1 / MAX_FPS)
+
+    def look(self, seconds, timeout=15.0):
+        """Detect for `seconds`, record the newest result and freeze it. Returns (caps, raw image)."""
+        with self.lock:
+            self.latest = ([], [], None)
+            self.detecting = True
+        end = time.monotonic() + seconds + timeout
+        time.sleep(seconds)
+        while time.monotonic() < end:
+            with self.lock:
+                if self.latest[2] is not None:
+                    break
+            time.sleep(0.1)
+        with self.lock:
+            self.detecting = False
+            caps, rejected, img = self.latest
+            self.frozen = (caps, rejected)
+        print(f"Recorded {len(caps)} cap(s) ({len(rejected)} blobs rejected). Detection is now off.")
+        return caps, img
 
 
 # ---------------- 3D positions ----------------
@@ -331,11 +454,23 @@ def camera_pose(robot, arm, rgb):
     return robot.frames.lookup(arm.planning_frame, frame_id)
 
 
+def camera_pixel(pixel, rgb_shape, target_shape=None):
+    """Convert a pixel of the upright image we detect on into the camera's own image coordinates
+    (undoing the 180 degree flip), scaled to `target_shape` (e.g. the depth image) if given."""
+    height, width = rgb_shape[:2]
+    target_height, target_width = (target_shape or rgb_shape)[:2]
+    u, v = pixel[0] / width, pixel[1] / height
+    if ROTATE_IMAGE_180:
+        u, v = 1.0 - u, 1.0 - v
+    return u * target_width, v * target_height
+
+
 def pixel_to_plane(robot, arm, intrinsics, rgb, pixel, plane_z):
     """3D point (planning frame) where the camera ray through `pixel` meets z = plane_z."""
     if intrinsics is None:
         raise RuntimeError("no camera intrinsics (camera_info missing)")
     cx, cy, fx, fy = pinhole(intrinsics)
+    pixel = camera_pixel(pixel, rgb.array.shape)
     camera = camera_pose(robot, arm, rgb)
     origin = camera.apply(Point(x=0.0, y=0.0, z=0.0))
     through = camera.apply(Point(x=(pixel[0] - cx) / fx, y=(pixel[1] - cy) / fy, z=1.0))
@@ -345,11 +480,12 @@ def pixel_to_plane(robot, arm, intrinsics, rgb, pixel, plane_z):
     return origin + direction * ((plane_z - origin.z) / direction.z)
 
 
-def locate_with_depth(robot, arm, intrinsics, depth_topic, pixel):
+def locate_with_depth(robot, arm, intrinsics, depth_topic, rgb, pixel):
     """3D point (planning frame) under `pixel`, measured from the depth image."""
     if intrinsics is None:
         raise RuntimeError("no camera intrinsics (camera_info missing)")
     depth = robot.core.get_image(depth_topic, timeout=3.0)
+    pixel = camera_pixel(pixel, rgb.array.shape, depth.array.shape)
     observation = sample_depth_point(depth, Pixel(x=float(pixel[0]), y=float(pixel[1])), intrinsics,
                                      window_size=5, min_depth_metres=0.05, max_depth_metres=3.0)
     if observation is None:
@@ -357,7 +493,7 @@ def locate_with_depth(robot, arm, intrinsics, depth_topic, pixel):
     return deproject_to_frame(observation, frames=robot.frames, target_frame=arm.planning_frame).point
 
 
-def locate_caps(robot, arm, intrinsics, locate, rgb, caps):
+def locate_caps(robot, arm, intrinsics, locate, rgb, caps, marks=None):
     """Cap-top centres in the planning frame, nearest the base first. point.z is the cap's top height.
 
     Round blobs whose real size (from the distance to the camera) is not a cap are dropped.
@@ -379,13 +515,15 @@ def locate_caps(robot, arm, intrinsics, locate, rgb, caps):
             continue
         if origin is not None:
             width_m = max(cap["bbox"][2], cap["bbox"][3]) * (point - origin).magnitude() / fx
-            if abs(width_m - CAP_WIDTH_M) > CAP_WIDTH_TOLERANCE_M:
-                print(f"  ignored a round blob {width_m * 100:.1f} cm wide at {fmt(point)} "
-                      f"(caps are {CAP_WIDTH_M * 100:.0f} cm)")
+            print(f"  cap at {fmt(point)} is about {width_m * 100:.1f} cm wide")
+            if CAP_WIDTH_M is not None and abs(width_m - CAP_WIDTH_M) > 0.3 * CAP_WIDTH_M:
+                print(f"  ignored it (caps should be {CAP_WIDTH_M * 100:.1f} cm)")
                 continue
         if any(math.hypot(point.x - q.x, point.y - q.y) < CAP_MERGE_M for q in found):
             continue
         found.append(point)
+        if marks is not None:
+            marks.append((cap["centre"], fmt(point)))
     found.sort(key=lambda q: math.hypot(q.x, q.y))
     return found
 
@@ -678,43 +816,62 @@ def put_back(arm, grasp):
     time.sleep(SETTLE_S)
 
 
-def stack_caps(arm, pump, locate_all):
-    """Look at the detection position, then pick the cap nearest the base and stack it on the other."""
-    caps, _bgr, rgb = pump(CAP_SCAN_S)
+def stack_caps(arm, view, locate_all):
+    """Record the caps once at the detection position. The cap nearest the robot is the base; every other
+    recorded cap is picked in turn and stacked on it (each one level higher)."""
+    view.stage = "recording the caps (once)"
+    caps, rgb = view.look(CAP_SCAN_S)
     if rgb is None:
         print("No camera frames; cannot look for caps")
         return False
-    points = locate_all(rgb, caps)
-    print(f"{len(points)} cap(s) located: {[fmt(p) for p in points]}")
+    marks = []
+    points = locate_all(rgb, caps, marks)
+    view.marks = marks
+    print(f"{len(points)} cap(s) recorded: {[fmt(p) for p in points]}")
     if len(points) < 2:
         print("Need two caps to stack. Check the annotated camera view: red boxes are rejected blobs.")
         return False
-    pick_point, base_point = points[0], points[1]
-    separation = math.hypot(pick_point.x - base_point.x, pick_point.y - base_point.y)
-    if separation < CAP_MIN_SEPARATION_M:
-        print(f"Warning: the caps are only {separation * 100:.0f} cm apart; the open fingers may touch the other cap")
-    print(f"Picking the cap at {fmt(pick_point)} and stacking it on the cap at {fmt(base_point)}")
-    try:
-        grasp = pick_cap(arm, pick_point)
-    except PickFailed as exc:
-        print(f"Could not pick the cap: {exc}")
-        return False
-    if place_on_cap(arm, base_point, grasp):
-        print("Done: the cap is stacked")
-        return True
-    put_back(arm, grasp)
-    return False
+    base, others = points[0], points[1:]
+    print(f"Base cap at {fmt(base)}; stacking {len(others)} more cap(s) on it")
+    stacked = 0
+    for level, pick_point in enumerate(others, start=1):
+        separation = math.hypot(pick_point.x - base.x, pick_point.y - base.y)
+        if separation < CAP_MIN_SEPARATION_M:
+            print(f"Warning: the caps are only {separation * 100:.0f} cm apart; the open fingers may touch the other cap")
+        print(f"Cap {level}/{len(others)}: picking the cap at {fmt(pick_point)}")
+        view.stage = f"picking cap {level}/{len(others)}"
+        view.marks = []   # the arm is moving: the positions would be stale
+        try:
+            grasp = pick_cap(arm, pick_point)
+        except PickFailed as exc:
+            print(f"Could not pick this cap: {exc}")
+            continue
+        view.stage = f"stacking cap {level}/{len(others)}"
+        top_of_stack = Point(x=base.x, y=base.y, z=base.z + CAP_HEIGHT_M * stacked)
+        if place_on_cap(arm, top_of_stack, grasp):
+            stacked += 1
+            print(f"Stacked {stacked} cap(s) on the base")
+        else:
+            put_back(arm, grasp)
+    print(f"Done: {stacked} of {len(others)} cap(s) stacked")
+    return stacked > 0
 
 
 try:
     with Client() as client:
         robot = client.robot()
-        rgb_topic = robot.core.topic(RGB_TOPIC, "sensor_msgs/msg/Image")
+        rgb_topic = robot.core.topic(RGB_TOPIC, "sensor_msgs/msg/CompressedImage")
         info_topic = robot.core.topic(CAMERA_INFO_TOPIC, "sensor_msgs/msg/CameraInfo")
         output_topic = robot.core.topic(OUTPUT_TOPIC, "sensor_msgs/msg/Image")
         depth_topic = robot.core.topic(DEPTH_TOPIC, "sensor_msgs/msg/Image")
         publisher = robot.core.publisher(output_topic)
         arm = robot.kinematics
+        frames = queue.Queue(maxsize=1)
+        errors = queue.Queue(maxsize=1)
+        threading.Thread(target=receive_latest, args=(robot, rgb_topic, frames, errors), daemon=True).start()
+        view = LiveView(lambda: grab_frame(frames, errors), publisher)
+        view.thread.start()
+        print(f"Publishing annotated frames to {OUTPUT_TOPIC} - add it as a camera panel.")
 
         if YOLO_MODEL_PATH:
             load_yolo()   # load before the arm moves, so a wrong path fails early
@@ -736,35 +893,35 @@ try:
                 intrinsics = None
                 print(f"No camera_info ({exc}); continuing without 3D positions.")
 
-            loop = {"last_state": None}
-            print(f"Publishing annotated frames to {OUTPUT_TOPIC} - add it as a camera panel.")
-
-            def pump(seconds=None):
-                return pump_frames(lambda: grab_bgr(robot, rgb_topic), publisher, loop, seconds)
-
             depth_warned = []
 
             def locate(rgb, pixel, plane_z):
-                """Depth-measured 3D point; falls back to the assumed table plane if depth fails."""
+                """Depth-measured 3D point; falls back to the assumed table plane only if REQUIRE_DEPTH is off."""
                 try:
-                    return locate_with_depth(robot, arm, intrinsics, depth_topic, pixel)
+                    return locate_with_depth(robot, arm, intrinsics, depth_topic, rgb, pixel)
                 except Exception as exc:
+                    if REQUIRE_DEPTH:
+                        raise RuntimeError(f"depth unavailable ({exc}); not guessing heights on the real robot") from exc
                     if not depth_warned:
                         print(f"  depth not usable ({exc}); using the assumed table plane instead")
                         depth_warned.append(True)
                     return pixel_to_plane(robot, arm, intrinsics, rgb, pixel, plane_z)
 
-            def locate_all(rgb, caps):
-                return locate_caps(robot, arm, intrinsics, locate, rgb, caps)
+            def locate_all(rgb, caps, marks):
+                return locate_caps(robot, arm, intrinsics, locate, rgb, caps, marks)
 
             print("[3] Stacking")
-            stack_caps(arm, pump, locate_all)
+            view.stage = "at the detection position"
+            stack_caps(arm, view, locate_all)
+            view.stage = "done: returning"
             move_to(arm, DETECTION_JOINTS, "detection")
         finally:
             # RULE 4: always return to the initial position, even on Ctrl+C or error.
             print("[4] Back to initial position")
+            view.stage = "returning to the initial position"
             move_to(arm, INITIAL_JOINTS, "initial")
             set_finger_gap(arm, INITIAL_FINGER_GAP_M)
+            view.stop.set()
 
 except KeyboardInterrupt:
     print("Stopped.")
