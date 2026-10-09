@@ -1,4 +1,7 @@
-"""Detect the cubes from the detection position, pick cube 1 up from the side and put it back."""
+"""Detect the cubes from the detection position, pick cube 1 up from the side and put it back.
+
+If the cube is too close to the base for a side grasp, it is first lifted by its top face and set down
+MOVE_AWAY_M further out, then found again and picked from the side."""
 
 import math
 import time
@@ -39,6 +42,13 @@ SIDE_PITCH_CANDIDATES_DEG = (135.0, 150.0, 120.0)
 # Roll about the tool z axis. With 0 / 180 deg the fingers open sideways (horizontally) when the tool is
 # horizontal; use +-90 deg instead if the fingers end up above and below the cube.
 SIDE_ROLLS_RAD = (0.0, math.pi)
+# A side grasp needs room between the base and the cube. A cube closer to the base than this is first
+# picked by its top face and set down MOVE_AWAY_M further out (away from the base), then picked from the side.
+SIDE_MIN_RADIUS_M = 0.50
+MOVE_AWAY_M = 0.05
+APPROACH_HEIGHT_M = 0.10       # top grasp: hover this far above the cube top before going down
+GRASP_BELOW_TOP_M = (0.01, 0.005, 0.0)   # top grasp: tool height under the cube top, tried in this order
+TOP_PITCH_CANDIDATES_DEG = (180.0, 165.0, 150.0, 135.0)   # top grasp tool tilt; 180 = straight down
 SETTLE_S = 0.5
 
 
@@ -322,6 +332,19 @@ def move_straight(arm, point, orientation):
     return pose
 
 
+def close_on_cube(arm):
+    """Plain close(): the fingers stop on the cube. On a timeout the real gap is checked against Rule 3."""
+    try:
+        arm.ee.close(timeout=GRIPPER_TIMEOUT_S)
+    except OloTimeoutError:
+        gap = measured_gap(arm)
+        print(f"Gripper close timed out; measured finger gap: {(gap or 0) * 100:.1f} cm")
+        if gap is not None and gap > MAX_FINGER_GAP_M + GAP_TOLERANCE_M:  # Rule 3 check after a timeout
+            arm.ee.goal(MAX_FINGER_GAP_M / 2.0, timeout=GRIPPER_TIMEOUT_S)
+            raise RuntimeError(f"Finger gap {gap * 100:.1f} cm exceeded the {MAX_FINGER_GAP_M * 100:.0f} cm limit; corrected")
+    time.sleep(SETTLE_S)
+
+
 def pick_cube(arm, top, yaw, holder):
     """Go in from the side, grasp two opposite faces of the cube and lift it.
 
@@ -375,15 +398,7 @@ def pick_cube(arm, top, yaw, holder):
 
     # From here on the cube may be in the gripper, so record it for the put-back in `finally`.
     holder[:] = [(grasp, standoff, orientation)]
-    try:
-        arm.ee.close(timeout=GRIPPER_TIMEOUT_S)  # plain close(): the fingers stop on the cube
-    except OloTimeoutError:
-        gap = measured_gap(arm)
-        print(f"Gripper close timed out; measured finger gap: {(gap or 0) * 100:.1f} cm")
-        if gap is not None and gap > MAX_FINGER_GAP_M + GAP_TOLERANCE_M:  # Rule 3 check after a timeout
-            arm.ee.goal(MAX_FINGER_GAP_M / 2.0, timeout=GRIPPER_TIMEOUT_S)
-            raise RuntimeError(f"Finger gap {gap * 100:.1f} cm exceeded the {MAX_FINGER_GAP_M * 100:.0f} cm limit; corrected")
-    time.sleep(SETTLE_S)
+    close_on_cube(arm)
     move_straight(arm, (grasp[0], grasp[1], grasp[2] + LIFT_HEIGHT_M), orientation)
     time.sleep(SETTLE_S)
 
@@ -397,6 +412,114 @@ def put_cube_back(arm, grasp, standoff, orientation):
     time.sleep(SETTLE_S)
     move_straight(arm, standoff, orientation)  # back out along the approach line
     time.sleep(SETTLE_S)
+
+
+def tool_orientation(azimuth, cube_yaw, pitch, turn):
+    """Tool orientation for a top grasp: pitch = 180 deg is straight down, smaller tilts the tool outward."""
+    k = azimuth - cube_yaw - turn * math.pi / 2
+    return (
+        Quaternion.from_rpy(0.0, 0.0, azimuth)
+        * Quaternion.from_rpy(0.0, pitch, 0.0)
+        * Quaternion.from_rpy(0.0, 0.0, k)
+    )
+
+
+def top_candidates(x, y, yaw, reference):
+    """(tilt in degrees, orientation) for a top grasp, most vertical first; the 2 turns closest to `reference`."""
+    azimuth = math.atan2(y, x)
+    result = []
+    for pitch_deg in TOP_PITCH_CANDIDATES_DEG:
+        options = [tool_orientation(azimuth, yaw, math.radians(pitch_deg), turn) for turn in range(4)]
+        options.sort(key=lambda q: -abs(quat_dot(q, reference)))
+        result.extend((pitch_deg, q) for q in options[:2])
+    return result
+
+
+def move_cube_outward(arm, top, yaw, holder):
+    """Lift the cube by its top face and set it down MOVE_AWAY_M further from the base."""
+    x, y, top_z = top
+    set_finger_gap(arm, PICK_GAP_M)
+    time.sleep(SETTLE_S)
+
+    last_error = None
+    hover = None
+    for pitch_deg, orientation in top_candidates(x, y, yaw, arm.pose().orientation):
+        try:
+            hover = Pose(position=Point(x=x, y=y, z=top_z + APPROACH_HEIGHT_M), orientation=orientation)
+            move_pose_slow(arm, hover)
+            print(f"Above the cube with tool tilt {pitch_deg:.0f} deg")
+            break
+        except Exception as exc:
+            last_error = exc
+            hover = None
+            bad = joints_outside_limits(arm)
+            if bad:
+                raise RuntimeError(
+                    f"A failed move left joints outside their limits: {bad}. Reset the simulation, then run again."
+                ) from exc
+    if hover is None:
+        raise RuntimeError(f"Cannot reach a position above the cube: {last_error}")
+    orientation = hover.orientation
+    time.sleep(SETTLE_S)
+
+    grasp_z = None
+    for below in GRASP_BELOW_TOP_M:
+        try:
+            move_straight(arm, (x, y, top_z - below), orientation)
+            grasp_z = top_z - below
+            break
+        except Exception as exc:
+            print(f"Cannot lower to {below * 1000:.0f} mm under the cube top: {exc}")
+    if grasp_z is None:
+        raise RuntimeError("Cannot lower onto the cube")
+    time.sleep(SETTLE_S)
+
+    holder[:] = [((x, y, grasp_z), (x, y, grasp_z + APPROACH_HEIGHT_M), orientation)]
+    close_on_cube(arm)
+    move_straight(arm, (x, y, grasp_z + LIFT_HEIGHT_M), orientation)
+    time.sleep(SETTLE_S)
+
+    # Carry it straight away from the base and set it down.
+    azimuth = math.atan2(y, x)
+    nx, ny = x + MOVE_AWAY_M * math.cos(azimuth), y + MOVE_AWAY_M * math.sin(azimuth)
+    print(f"Moving the cube {MOVE_AWAY_M * 100:.0f} cm further out, to ({nx:.3f}, {ny:.3f})")
+    move_pose_slow(arm, Pose(position=Point(x=nx, y=ny, z=grasp_z + LIFT_HEIGHT_M), orientation=orientation))
+    time.sleep(SETTLE_S)
+    holder[:] = [((nx, ny, grasp_z), (nx, ny, grasp_z + APPROACH_HEIGHT_M), orientation)]
+    put_cube_back(arm, *holder[0])  # lower it, let go, back off upwards
+    holder.clear()
+
+
+def detect_cube(robot, arm, rgb_topic, depth_topic, detector, intrinsics, publisher):
+    """Look at the table for DETECT_FRAMES frames; return the top-face centre and yaw of cube 1."""
+    print(f"Detecting cubes ({DETECT_FRAMES} frames); publishing to {ANNOTATED_TOPIC}")
+    positions = []
+    yaws = []
+    for _ in range(DETECT_FRAMES):
+        rgb = robot.core.get_image(rgb_topic)
+        try:
+            depth = robot.core.get_image(depth_topic, timeout=DEPTH_TIMEOUT_S)
+        except OloTimeoutError:
+            depth = None
+        frame = detector.detect(rgb, intrinsics=intrinsics)
+        image, cubes = annotate(rgb, depth, frame)
+        publisher.publish(image)
+        # Cube 1 = the left-most cube in the image, the same numbering as the overlay.
+        posed = [t for t in frame.tags if t.transform is not None]
+        if posed:
+            # With one cube it is the only candidate; with several, the left-most one is picked.
+            first = min(posed, key=lambda t: (np.mean([c.x for c in t.corners]), np.mean([c.y for c in t.corners])))
+            top, yaw = locate_cube(robot, arm, first)
+            positions.append(top)
+            yaws.append(yaw)
+        time.sleep(1.0 / MAX_FPS)
+    if not positions:
+        raise RuntimeError("No cube with a pose was detected; nothing to pick")
+    top = tuple(float(np.median([p[i] for p in positions])) for i in range(3))
+    yaw = average_yaw(yaws)
+    print(f"Cube 1 top face at ({top[0]:.3f}, {top[1]:.3f}, {top[2]:.3f}) m, "
+          f"{math.hypot(top[0], top[1]):.3f} m from the base, yaw {math.degrees(yaw):+.0f} deg")
+    return top, yaw
 
 
 # ---------------- Main sequence ----------------
@@ -426,36 +549,20 @@ with Client() as client:
             robot.core.topic(ANNOTATED_TOPIC, "sensor_msgs/msg/Image")
         )
 
-        print(f"Detecting cubes ({DETECT_FRAMES} frames); publishing to {ANNOTATED_TOPIC}")
-        positions = []
-        yaws = []
-        for _ in range(DETECT_FRAMES):
-            rgb = robot.core.get_image(rgb_topic)
-            try:
-                depth = robot.core.get_image(depth_topic, timeout=DEPTH_TIMEOUT_S)
-            except OloTimeoutError:
-                depth = None
-            frame = detector.detect(rgb, intrinsics=intrinsics)
-            image, cubes = annotate(rgb, depth, frame)
-            publisher.publish(image)
-            # Cube 1 = the left-most cube in the image, the same numbering as the overlay.
-            posed = [t for t in frame.tags if t.transform is not None]
-            if posed:
-                # With one cube it is the only candidate; with several, the left-most one is picked.
-                first = min(posed, key=lambda t: (np.mean([c.x for c in t.corners]), np.mean([c.y for c in t.corners])))
-                top, yaw = locate_cube(robot, arm, first)
-                positions.append(top)
-                yaws.append(yaw)
-            time.sleep(1.0 / MAX_FPS)
-        if not positions:
-            raise RuntimeError("No cube with a pose was detected; nothing to pick")
+        top, yaw = detect_cube(robot, arm, rgb_topic, depth_topic, detector, intrinsics, publisher)
 
-        top = tuple(float(np.median([p[i] for p in positions])) for i in range(3))
-        yaw = average_yaw(yaws)
-        print(f"Cube 1 top face at ({top[0]:.3f}, {top[1]:.3f}, {top[2]:.3f}) m, yaw {math.degrees(yaw):+.0f} deg")
+        if math.hypot(top[0], top[1]) < SIDE_MIN_RADIUS_M:
+            # Too close to the base for a side grasp: lift it by the top face and set it down further out.
+            print(f"[3] Cube is closer than {SIDE_MIN_RADIUS_M:.2f} m to the base; moving it {MOVE_AWAY_M * 100:.0f} cm further out")
+            move_cube_outward(arm, top, yaw, held)
+            # RULE 2: look for it again from the detection position.
+            print("[3b] Back to the detection position to find the cube again")
+            move_to(arm, DETECTION_JOINTS, "detection")
+            set_finger_gap(arm, DETECTION_FINGER_GAP_M)
+            top, yaw = detect_cube(robot, arm, rgb_topic, depth_topic, detector, intrinsics, publisher)
 
         # ---- pick the cube up from the side, then put it back ----
-        print("[3] Picking cube 1 from the side")
+        print("[4] Picking cube 1 from the side")
         pick_cube(arm, top, yaw, held)
         put_cube_back(arm, *held[0])
         held.clear()
@@ -468,7 +575,7 @@ with Client() as client:
             except Exception as exc:
                 cube_in_gripper = True
                 print(f"WARNING: could not put the cube back ({exc}); it may still be in the gripper")
-        print("[4] Back to initial position")
+        print("[5] Back to initial position")
         try:
             move_to(arm, INITIAL_JOINTS, "initial")
         except Exception:

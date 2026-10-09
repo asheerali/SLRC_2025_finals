@@ -98,7 +98,9 @@ A run is only complete once the arm is back at the initial position.
 - **Cube pick exception (`my_cude_pickup.py` only):** after detection at the detection position, the
   arm may use `move_pose` (hover above the cube, collision checking first) and `move_linear` (straight
   in/out along the approach line, and up/down) to pick cube 1 up from the side (gripper horizontal,
-  fingers on two opposite faces) and put it back where it was. Rules that still apply:
+  fingers on two opposite faces) and put it back where it was. If the cube is too close to the base for a side grasp, it is first
+  lifted by its top face and set down 5 cm further out, then found again from the detection position
+  (Rule 2) and picked from the side. Rules that still apply:
   `speed_scaling = 0.1` on every motion, the gripper opens to at most 10 cm (Rule 3) and closes with a
   plain `close()` on the cube only, a held cube is put back and released before the fingers close
   again, and Rule 4 (return to initial) always runs.
