@@ -14,10 +14,18 @@ from olo.kinematics import JointTarget
 from olo.spatial import Point
 from olo.vision import camera_info_to_intrinsics, project
 
-RGB_TOPIC = "wrist_rgbd/image/compressed"
-CAMERA_INFO_TOPIC = "wrist_rgbd/camera_info"
-OUTPUT_TOPIC = "wrist_rgbd/annotated"
+# Camera topics differ between the simulation and the real robot.
+USE_REAL_ROBOT = True       # False = simulation
+if USE_REAL_ROBOT:
+    RGB_TOPIC = "camera/color/image_raw/compressed"
+    CAMERA_INFO_TOPIC = "camera/color/camera_info"   # assumed; check your topic list
+    OUTPUT_TOPIC = "camera/annotated"
+else:
+    RGB_TOPIC = "wrist_rgbd/image/compressed"
+    CAMERA_INFO_TOPIC = "wrist_rgbd/camera_info"
+    OUTPUT_TOPIC = "wrist_rgbd/annotated"
 MAX_FPS = 10
+NO_FRAMES_WARNING_S = 5.0   # warn if the camera topic stays silent this long
 
 # The cubes carry one DICT_4X4_50 marker per face (IDs 0-5: front, right,
 # back, left, top, bottom). Several cubes share the same IDs, so markers are
@@ -342,6 +350,9 @@ def annotate(rgb: Image, cubes) -> Image:
         left = int(pts[:, 0].min())
         cv2.putText(canvas, label, (left, max(top - 6, 14)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
+    # Status line so an empty frame is clearly "annotation running, nothing found".
+    cv2.putText(canvas, f"detection: {len(cubes)} cube(s)", (8, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
     return Image(array=canvas, encoding="bgr8", header=rgb.header)
 
 
