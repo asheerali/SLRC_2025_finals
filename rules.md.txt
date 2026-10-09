@@ -1,0 +1,115 @@
+# Arm Motion Rules
+
+Rules for the arm detection script (`real_position_backer`), built on the OLO Python SDK.
+Every run of the script must follow these rules.
+
+---
+
+## Rule 1 — Always start from the initial position
+
+Before doing anything else, the script checks whether the arm is at the **initial position**.
+
+- If every arm joint is within **0.01 rad (~0.6°)** of the initial value, the arm is considered already there and does not move.
+- If any joint is outside that tolerance, the arm **must move to the initial position first**.
+- No other motion is allowed until the arm is confirmed at the initial position.
+
+**Initial position (radians):**
+
+| Joint  | Value   |
+|--------|---------|
+| joint1 | -0.0040 |
+| joint2 | -0.0013 |
+| joint3 | -0.0055 |
+| joint4 |  0.0078 |
+| joint5 | -0.0227 |
+| joint6 | -0.0090 |
+
+**Initial finger state:** closed (finger_left `0.0002`, finger_right `-0.0002`, total gap ≈ 0.4 mm).
+
+---
+
+## Rule 2 — Detection is always done at the detection position
+
+Detection must **only** be performed with the arm at the fixed **detection position** below.
+The values must not be changed per run and must not be replaced by any other pose.
+
+**Detection position (radians):**
+
+| Joint  | Value   | Degrees |
+|--------|---------|---------|
+| joint1 |  0.0000 |    0°   |
+| joint2 | -1.5708 |  -90°   |
+| joint3 | -1.5708 |  -90°   |
+| joint4 |  1.0472 |   60°   |
+| joint5 |  0.0000 |    0°   |
+| joint6 |  0.0000 |    0°   |
+
+- Before moving, every target joint is checked against the robot model's joint limits. If any value is out of range, the script stops without moving.
+- When the arm reaches the detection position, the fingers open to the detection gap (see Rule 3).
+
+---
+
+## Rule 3 — Finger gap must never exceed 10 cm
+
+The total distance between the two fingers must **never be more than 10 cm (0.10 m)**.
+
+| Setting                  | Value            |
+|--------------------------|------------------|
+| `MAX_FINGER_GAP_M`       | `0.10` (10 cm)   |
+| `DETECTION_FINGER_GAP_M` | `0.10` (10 cm)   |
+
+The rule is enforced in three places:
+
+1. **Before commanding:** any requested gap above 10 cm is clamped down to 10 cm.
+2. **Hardware range:** the gap is also clamped to the gripper's own min/max range from the robot model.
+3. **After commanding:** the real gap is measured from `finger_left` and `finger_right`.
+   If it is more than 10 cm (plus 2 mm tolerance), the gripper is immediately corrected back to 10 cm and the script stops with an error.
+
+The fingers are mirrored, so each finger moves **half** of the total gap (10 cm gap = 5 cm per finger).
+
+---
+
+## Rule 4 — Always return to the initial position
+
+After detection, the arm **must return to the initial position** and the fingers must close back to the initial finger state.
+A run is only complete once the arm is back at the initial position.
+
+---
+
+## Rule 5 — Move slowly and safely
+
+- All arm moves use `speed_scaling = 0.1` (10% of maximum joint speed).
+- Arm moves use `move_joints` (joint-space). Straight-line moves are avoided from the initial position because all joints near 0 is a singular (fully stretched) configuration.
+- Gripper commands wait up to **15 s**. On timeout, the real finger gap is measured and checked against Rule 3 instead of failing blindly.
+- Keep the emergency stop available and the workspace clear before running on real hardware.
+
+---
+
+## Run sequence
+
+```
+1. Check initial position  ──► not there? move to initial position
+2. Close fingers to initial state
+3. Move to detection position
+4. Open fingers to 10 cm  (never more than 10 cm)
+5. ── detection happens here ──
+6. Move back to initial position
+7. Close fingers to initial state
+```
+
+---
+
+## Changing the rules
+
+All rule values are constants at the top of the script:
+
+```python
+INITIAL_JOINTS          # Rule 1 / Rule 4
+DETECTION_JOINTS        # Rule 2
+MAX_FINGER_GAP_M = 0.10 # Rule 3 — hard limit
+DETECTION_FINGER_GAP_M = 0.10
+JOINT_TOLERANCE_RAD = 0.01
+SPEED = 0.1             # Rule 5
+```
+
+`DETECTION_FINGER_GAP_M` must always be less than or equal to `MAX_FINGER_GAP_M`.
