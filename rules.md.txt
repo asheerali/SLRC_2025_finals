@@ -100,6 +100,64 @@ A run is only complete once the arm is back at the initial position.
 
 ---
 
+## Rule 6 — Visualization and YOLO detection
+
+Detection only runs at the detection position (Rule 2). The camera topics, the YOLO call and the
+annotated output are used like this (see `my_cude_pickup.py`).
+
+**Topics (constants at the top of the script):**
+
+```python
+RGB_TOPIC       = "wrist_rgbd/image"         # input: colour frames (color_image times out in the sim)
+DEPTH_TOPIC     = "wrist_rgbd/depth_image"   # input: depth frames
+ANNOTATED_TOPIC = "wrist_rgbd/annotated"     # output: frames with boxes drawn, for visualization
+CONFIDENCE      = 0.4                        # minimum YOLO score
+MAX_FPS         = 10                         # detection rate limit
+```
+
+All three are `sensor_msgs/msg/Image`.
+
+**Receiving frames:**
+
+- Subscribe to the RGB and depth topics each in its own daemon thread, with `robot.core.subscribe(topic)`.
+- Keep only the latest frame per topic in a `queue.Queue(maxsize=1)` (drop the old one when a new one arrives).
+- Pass thread errors through an `errors` queue and re-raise them in the main loop.
+- Convert each message with `image_message_to_frame(message)`.
+- Start the subscriptions only after the arm is at the detection position.
+
+**Calling YOLO:**
+
+```python
+from olo.ai.yolo import YoloDetector
+
+with client.ai.load_model("yolox_s.onnx") as model:
+    detector = YoloDetector(model)
+    detections = detector.detect(rgb, conf=CONFIDENCE)
+```
+
+- Each detection has `.label`, `.score` and `.box` (`detection.box.to_xyxy()` gives pixel corners).
+- Wrap `detect` in `try/except` so one bad frame does not stop the run.
+- Run at most `MAX_FPS` frames per second.
+
+**Distance and drawing:**
+
+- Get the distance with `sample_depth_region(depth, detection.box)` (from `olo.vision`). It raises
+  `ValueError` when there is no valid depth. In that case show the label and score only.
+- Draw with OpenCV on a copy of `rgb.array`: a green rectangle plus the caption `"<label> <score> <depth>m"`.
+
+**Publishing for visualization:**
+
+```python
+annotated_topic = robot.core.topic(ANNOTATED_TOPIC, "sensor_msgs/msg/Image")
+publisher = robot.core.publisher(annotated_topic)
+publisher.publish(Image(array=canvas, encoding="bgr8", header=rgb.header))
+```
+
+- Publish the annotated frame when there are detections, and the plain RGB frame when there are none.
+- Open `wrist_rgbd/annotated` in the viewer to watch the detections.
+
+---
+
 ## Run sequence
 
 ```
@@ -107,7 +165,7 @@ A run is only complete once the arm is back at the initial position.
 2. Close fingers to initial state
 3. Move to detection position
 4. Open fingers to 10 cm  (never more than 10 cm)
-5. ── detection happens here ──
+5. ── detection happens here (Rule 6: subscribe, run YOLO, publish annotated frames) ──
 6. Move back to initial position
 7. Close fingers to initial state
 ```
