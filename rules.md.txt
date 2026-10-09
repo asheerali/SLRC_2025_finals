@@ -97,7 +97,8 @@ A run is only complete once the arm is back at the initial position.
   the cap goes back where it was if its box cannot be reached, and Rule 4 (return to initial) always runs.
 - **Cube pick exception (`my_cude_pickup.py` only):** after detection at the detection position, the
   arm may use `move_pose` (hover above the cube, collision checking first) and `move_linear` (straight
-  up/down only) to pick cube 1 by its top face and put it back where it was. Rules that still apply:
+  in/out along the approach line, and up/down) to pick cube 1 up from the side (gripper horizontal,
+  fingers on two opposite faces) and put it back where it was. Rules that still apply:
   `speed_scaling = 0.1` on every motion, the gripper opens to at most 10 cm (Rule 3) and closes with a
   plain `close()` on the cube only, a held cube is put back and released before the fingers close
   again, and Rule 4 (return to initial) always runs.

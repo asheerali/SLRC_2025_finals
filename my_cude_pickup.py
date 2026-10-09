@@ -1,4 +1,4 @@
-"""Detect the cubes from the detection position, pick cube 1 up by its top face and put it back."""
+"""Detect the cubes from the detection position, pick cube 1 up from the side and put it back."""
 
 import math
 import time
@@ -26,12 +26,19 @@ MAX_FPS = 8
 DETECT_FRAMES = 10             # frames averaged to locate the cube before picking
 
 # ---------------- Cube pick and put-back (Rule 5 cube exception) ----------------
-PICK_GAP_M = 0.10              # gripper opening while approaching (never above MAX_FINGER_GAP_M)
-APPROACH_HEIGHT_M = 0.10       # hover this far above the cube top before going down
+PICK_GAP_M = min(CUBE_SIZE_M + 0.04, 0.10)  # opening while approaching: cube + 4 cm, never above the 10 cm rule
+SIDE_STANDOFF_M = 0.08         # stop this far in front of the cube's near face before going in
+SIDE_PENETRATION_M = (0.02, 0.01, 0.0)   # how far the fingertips go past the near face, tried in this order
+SIDE_HEIGHT_OFFSET_M = 0.01    # grasp this far above the cube centre (keeps the fingers off the table)
 LIFT_HEIGHT_M = 0.10           # how far the cube is lifted
-GRASP_BELOW_TOP_M = (0.01, 0.005, 0.0)   # tool height under the cube top, tried in this order
 PLACE_CONTACT_GAP_M = 0.002    # release this far above where the cube was picked from
-PITCH_CANDIDATES_DEG = (180.0, 165.0, 150.0, 135.0)   # tool tilt to try; 180 = straight down
+# Tool tilt (degrees) to try for the side grasp, in order: 90 = tool horizontal, 180 = straight down.
+# A fully horizontal tool pushes joint4 past its limit at this distance, so it comes in from the base
+# side tilted down by 45, 60 or 30 degrees; the fingers still close on two opposite side faces.
+SIDE_PITCH_CANDIDATES_DEG = (135.0, 150.0, 120.0)
+# Roll about the tool z axis. With 0 / 180 deg the fingers open sideways (horizontally) when the tool is
+# horizontal; use +-90 deg instead if the fingers end up above and below the cube.
+SIDE_ROLLS_RAD = (0.0, math.pi)
 SETTLE_S = 0.5
 
 
@@ -246,30 +253,54 @@ def average_yaw(yaws):
     return math.atan2(sum(math.sin(4 * y) for y in yaws), sum(math.cos(4 * y) for y in yaws)) / 4
 
 
-def tool_orientation(azimuth, cube_yaw, pitch, turn):
-    """Tool orientation for a top grasp (same convention as sim_cube_pick.py).
-
-    pitch = 180 deg is straight down; smaller values tilt the tool outward, away from the base
-    (azimuth = direction from the base to the cube), which reaches cubes far from the base.
-    The tool x axis is lined up with a cube edge; `turn` picks one of the four 90-degree equivalents.
-    """
-    k = azimuth - cube_yaw - turn * math.pi / 2
+def rotate(q, v):
+    """Rotate the 3-vector `v` by the quaternion `q` (x, y, z, w order)."""
+    x, y, z, w = q.array()
+    vx, vy, vz = v
+    tx, ty, tz = 2 * (y * vz - z * vy), 2 * (z * vx - x * vz), 2 * (x * vy - y * vx)
     return (
-        Quaternion.from_rpy(0.0, 0.0, azimuth)
-        * Quaternion.from_rpy(0.0, pitch, 0.0)
-        * Quaternion.from_rpy(0.0, 0.0, k)
+        vx + w * tx + (y * tz - z * ty),
+        vy + w * ty + (z * tx - x * tz),
+        vz + w * tz + (x * ty - y * tx),
     )
 
 
-def tool_candidates(x, y, yaw, reference):
-    """(tilt in degrees, orientation) to try, most vertical first; the 2 turns closest to `reference` per tilt."""
+def side_orientation(heading, pitch, roll):
+    """Tool orientation for a side grasp.
+
+    The tool z axis (the approach direction) points along `heading` (an angle in the horizontal
+    plane); pitch = 90 deg is horizontal. The roll about the tool z axis puts the
+    finger opening horizontal, so the fingers close on two opposite side faces.
+    """
+    return (
+        Quaternion.from_rpy(0.0, 0.0, heading)
+        * Quaternion.from_rpy(0.0, pitch, 0.0)
+        * Quaternion.from_rpy(0.0, 0.0, roll)
+    )
+
+
+def side_candidates(x, y, yaw, reference):
+    """(tilt in degrees, orientation) to try: approach the cube's side face that faces the base first."""
     azimuth = math.atan2(y, x)
+    headings = [yaw + k * math.pi / 2 for k in range(4)]  # directions perpendicular to a cube face
+    headings.sort(key=lambda h: abs(math.atan2(math.sin(h - azimuth), math.cos(h - azimuth))))
     result = []
-    for pitch_deg in PITCH_CANDIDATES_DEG:
-        options = [tool_orientation(azimuth, yaw, math.radians(pitch_deg), turn) for turn in range(4)]
-        options.sort(key=lambda q: -abs(quat_dot(q, reference)))
-        result.extend((pitch_deg, q) for q in options[:2])
+    for pitch_deg in SIDE_PITCH_CANDIDATES_DEG:
+        for heading in headings[:2]:
+            options = [side_orientation(heading, math.radians(pitch_deg), roll) for roll in SIDE_ROLLS_RAD]
+            options.sort(key=lambda q: -abs(quat_dot(q, reference)))
+            result.extend((pitch_deg, q) for q in options)
     return result
+
+
+def joints_outside_limits(arm):
+    """Names of arm joints that are currently outside the robot model's limits."""
+    current = arm.joints().position_by_name
+    bad = []
+    for j in arm.model.joints:
+        if j.name in current and j.lower_limit < j.upper_limit and not (j.lower_limit <= current[j.name] <= j.upper_limit):
+            bad.append(f"{j.name}={current[j.name]:.3f} (limits {j.lower_limit:.3f}..{j.upper_limit:.3f})")
+    return bad
 
 
 def move_pose_slow(arm, pose):
@@ -284,69 +315,87 @@ def move_pose_slow(arm, pose):
     raise last_error
 
 
-def move_straight(arm, x, y, z, orientation):
-    """Straight-line move to (x, y, z) at SPEED; returns the pose."""
-    pose = Pose(position=Point(x=x, y=y, z=z), orientation=orientation)
+def move_straight(arm, point, orientation):
+    """Straight-line move to `point` (x, y, z) at SPEED; returns the pose."""
+    pose = Pose(position=Point(x=point[0], y=point[1], z=point[2]), orientation=orientation)
     arm.move_linear(pose, speed_scaling=SPEED)
     return pose
 
 
 def pick_cube(arm, top, yaw, holder):
-    """Hover above the cube, go down, grasp its top face and lift it. Returns (x, y, grasp_z, orientation)."""
-    x, y, top_z = top
+    """Go in from the side, grasp two opposite faces of the cube and lift it.
+
+    `top` is the top-face centre; the cube centre is half a cube below it. Fills `holder` with
+    [(grasp_point, standoff_point, orientation)] once the cube may be in the gripper.
+    """
+    half = CUBE_SIZE_M / 2
+    centre = (top[0], top[1], top[2] - half + SIDE_HEIGHT_OFFSET_M)
     set_finger_gap(arm, PICK_GAP_M)
     time.sleep(SETTLE_S)
 
+    # Pre-grasp: in front of the cube's near face, tool pointing at the cube.
     last_error = None
-    hover = None
-    for pitch_deg, orientation in tool_candidates(x, y, yaw, arm.pose().orientation):
+    chosen = None
+    for pitch_deg, orientation in side_candidates(centre[0], centre[1], yaw, arm.pose().orientation):
+        d = rotate(orientation, (0.0, 0.0, 1.0))  # approach direction (tool z)
+        standoff = tuple(centre[i] - d[i] * (half + SIDE_STANDOFF_M) for i in range(3))
         try:
-            hover = Pose(position=Point(x=x, y=y, z=top_z + APPROACH_HEIGHT_M), orientation=orientation)
-            move_pose_slow(arm, hover)
-            print(f"Above the cube with tool tilt {pitch_deg:.0f} deg")
+            move_pose_slow(arm, Pose(position=Point(x=standoff[0], y=standoff[1], z=standoff[2]), orientation=orientation))
+            print(f"In front of the cube with tool tilt {pitch_deg:.0f} deg")
+            chosen = (orientation, d, standoff)
             break
         except Exception as exc:
             last_error = exc
-            hover = None
-    if hover is None:
+            bad = joints_outside_limits(arm)
+            if bad:  # the planner refuses to plan from here, so trying more poses is pointless
+                raise RuntimeError(
+                    f"A failed move left joints outside their limits: {bad}. Reset the simulation / "
+                    f"move the joints back, then run again. Last error: {exc}"
+                ) from exc
+    if chosen is None:
         raise RuntimeError(
-            f"Cannot reach a position above the cube at radius {math.hypot(x, y):.3f} m from the base "
-            f"(tried tool tilts {PITCH_CANDIDATES_DEG}): {last_error}"
+            f"Cannot reach the side of the cube at radius {math.hypot(centre[0], centre[1]):.3f} m from the base: {last_error}"
         )
+    orientation, d, standoff = chosen
     time.sleep(SETTLE_S)
 
-    grasp_z = None
-    for below in GRASP_BELOW_TOP_M:
+    # Go straight in until the fingertips are past the near face.
+    grasp = None
+    for penetration in SIDE_PENETRATION_M:
+        point = tuple(centre[i] - d[i] * (half - penetration) for i in range(3))
         try:
-            move_straight(arm, x, y, top_z - below, hover.orientation)
-            grasp_z = top_z - below
+            move_straight(arm, point, orientation)
+            grasp = point
             break
         except Exception as exc:
-            print(f"Cannot lower to {below * 1000:.0f} mm under the cube top: {exc}")
-    if grasp_z is None:
-        raise RuntimeError("Cannot lower onto the cube")
+            print(f"Cannot go in {penetration * 1000:.0f} mm past the cube face: {exc}")
+    if grasp is None:
+        raise RuntimeError("Cannot move in to the cube")
     time.sleep(SETTLE_S)
 
     # From here on the cube may be in the gripper, so record it for the put-back in `finally`.
-    holder[:] = [(x, y, grasp_z, hover.orientation)]
+    holder[:] = [(grasp, standoff, orientation)]
     try:
         arm.ee.close(timeout=GRIPPER_TIMEOUT_S)  # plain close(): the fingers stop on the cube
     except OloTimeoutError:
-        print(f"Gripper close timed out; measured finger gap: {(measured_gap(arm) or 0) * 100:.1f} cm")
+        gap = measured_gap(arm)
+        print(f"Gripper close timed out; measured finger gap: {(gap or 0) * 100:.1f} cm")
+        if gap is not None and gap > MAX_FINGER_GAP_M + GAP_TOLERANCE_M:  # Rule 3 check after a timeout
+            arm.ee.goal(MAX_FINGER_GAP_M / 2.0, timeout=GRIPPER_TIMEOUT_S)
+            raise RuntimeError(f"Finger gap {gap * 100:.1f} cm exceeded the {MAX_FINGER_GAP_M * 100:.0f} cm limit; corrected")
     time.sleep(SETTLE_S)
-    move_straight(arm, x, y, grasp_z + LIFT_HEIGHT_M, hover.orientation)
+    move_straight(arm, (grasp[0], grasp[1], grasp[2] + LIFT_HEIGHT_M), orientation)
     time.sleep(SETTLE_S)
-    return x, y, grasp_z, hover.orientation
 
 
-def put_cube_back(arm, x, y, grasp_z, orientation):
-    """Lower the held cube to where it was, let go, and back off straight up."""
+def put_cube_back(arm, grasp, standoff, orientation):
+    """Lower the held cube to where it was, let go, and back straight out of the way."""
     print("Putting the cube back...")
-    move_straight(arm, x, y, grasp_z + PLACE_CONTACT_GAP_M, orientation)
+    move_straight(arm, (grasp[0], grasp[1], grasp[2] + PLACE_CONTACT_GAP_M), orientation)
     time.sleep(SETTLE_S)
     set_finger_gap(arm, PICK_GAP_M)  # open, never more than 10 cm
     time.sleep(SETTLE_S)
-    move_straight(arm, x, y, grasp_z + APPROACH_HEIGHT_M, orientation)
+    move_straight(arm, standoff, orientation)  # back out along the approach line
     time.sleep(SETTLE_S)
 
 
@@ -354,7 +403,7 @@ def put_cube_back(arm, x, y, grasp_z, orientation):
 with Client() as client:
     robot = client.robot()
     arm = robot.kinematics
-    held = []  # [(x, y, grasp_z, orientation)] while a cube may be in the gripper
+    held = []  # [(grasp_point, standoff_point, orientation)] while a cube may be in the gripper
 
     # RULE 1: always start from the initial position.
     print("[1] Initial position")
@@ -405,20 +454,30 @@ with Client() as client:
         yaw = average_yaw(yaws)
         print(f"Cube 1 top face at ({top[0]:.3f}, {top[1]:.3f}, {top[2]:.3f}) m, yaw {math.degrees(yaw):+.0f} deg")
 
-        # ---- pick the cube up by its top face, then put it back ----
-        print("[3] Picking cube 1")
+        # ---- pick the cube up from the side, then put it back ----
+        print("[3] Picking cube 1 from the side")
         pick_cube(arm, top, yaw, held)
         put_cube_back(arm, *held[0])
         held.clear()
     finally:
         # RULE 4: always return to the initial position, even if a step failed.
+        cube_in_gripper = False
         if held:
             try:  # do not squeeze the cube shut: put it down and let go first
                 put_cube_back(arm, *held[0])
             except Exception as exc:
+                cube_in_gripper = True
                 print(f"WARNING: could not put the cube back ({exc}); it may still be in the gripper")
         print("[4] Back to initial position")
-        move_to(arm, INITIAL_JOINTS, "initial")
-        set_finger_gap(arm, INITIAL_FINGER_GAP_M)
+        try:
+            move_to(arm, INITIAL_JOINTS, "initial")
+        except Exception:
+            print(f"Could not return to the initial position. Joints outside their limits: {joints_outside_limits(arm)}. "
+                  "Reset the simulation (or move the joints back inside their limits) and run again.")
+            raise
+        if cube_in_gripper:
+            print("WARNING: not closing the fingers because the cube may still be held")
+        else:
+            set_finger_gap(arm, INITIAL_FINGER_GAP_M)
 
     print("Done: back at the initial position")
