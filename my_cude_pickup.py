@@ -1,5 +1,6 @@
-"""Go to the detection position and detect the cubes (ArUco tags) from there."""
+"""Detect the cubes from the detection position, pick cube 1 up by its top face and put it back."""
 
+import math
 import time
 
 import cv2
@@ -9,14 +10,29 @@ from olo import Client
 from olo.core.images import Image
 from olo.errors import OloTimeoutError
 from olo.kinematics import JointTarget
+from olo.spatial import Point, Pose, Quaternion
 from olo.vision import camera_info_to_intrinsics
 
 RGB_TOPIC = "wrist_rgbd/image"
+DEPTH_TOPIC = "wrist_rgbd/depth_image"
 CAMERA_INFO_TOPIC = "wrist_rgbd/camera_info"
+DEPTH_TIMEOUT_S = 2.0
 ANNOTATED_TOPIC = "wrist_rgbd/annotated"   # add this as a camera panel to see the detections
 TAG_FAMILY = "aruco_4x4_50"
 MARKER_SIZE_M = 0.036
+CUBE_SIZE_M = 0.05
+TOP_FACE_SCALE = CUBE_SIZE_M / MARKER_SIZE_M   # marker outline -> whole top face (white margin)
 MAX_FPS = 8
+DETECT_FRAMES = 10             # frames averaged to locate the cube before picking
+
+# ---------------- Cube pick and put-back (Rule 5 cube exception) ----------------
+PICK_GAP_M = 0.10              # gripper opening while approaching (never above MAX_FINGER_GAP_M)
+APPROACH_HEIGHT_M = 0.10       # hover this far above the cube top before going down
+LIFT_HEIGHT_M = 0.10           # how far the cube is lifted
+GRASP_BELOW_TOP_M = (0.01, 0.005, 0.0)   # tool height under the cube top, tried in this order
+PLACE_CONTACT_GAP_M = 0.002    # release this far above where the cube was picked from
+PITCH_CANDIDATES_DEG = (180.0, 165.0, 150.0, 135.0)   # tool tilt to try; 180 = straight down
+SETTLE_S = 0.5
 
 
 # ---------------- Positions (radians) ----------------
@@ -164,25 +180,181 @@ def set_finger_gap(arm, gap_m):
         print("Warning: fingers did not reach the target gap (more than 1 cm off)")
 
 
-def annotate(rgb, frame):
-    """Draw each detected tag (outline, centre, id) on a copy of the camera image."""
+def top_depth_m(depth, pts, rgb_shape):
+    """Median depth (metres) over the cube's top-face outline `pts` (RGB pixels), or None."""
+    arr = np.asarray(depth.array)
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    scale = [arr.shape[1] / rgb_shape[1], arr.shape[0] / rgb_shape[0]]
+    mask = np.zeros(arr.shape, np.uint8)
+    cv2.fillPoly(mask, [(pts * scale).astype(np.int32)], 1)
+    values = arr[mask.astype(bool)].astype(np.float64)
+    if arr.dtype == np.uint16:
+        values /= 1000.0  # millimetres -> metres
+    values = values[np.isfinite(values) & (values > 0)]
+    return float(np.median(values)) if values.size else None
+
+
+def annotate(rgb, depth, frame):
+    """Draw each cube's top-face outline with its depth on a copy of the camera image."""
     canvas = np.ascontiguousarray(rgb.array).copy()
-    for tag in frame.tags:
-        pts = np.array([(c.x, c.y) for c in tag.corners], np.int32)
+    tags = sorted(frame.tags, key=lambda t: (np.mean([c.x for c in t.corners]), np.mean([c.y for c in t.corners])))
+    cubes = []
+    for number, tag in enumerate(tags, start=1):
+        marker = np.array([(c.x, c.y) for c in tag.corners], np.float32)
+        centre = marker.mean(axis=0)
+        pts = ((marker - centre) * TOP_FACE_SCALE + centre).astype(np.int32)  # whole top face
+        top_m = top_depth_m(depth, pts, canvas.shape) if depth is not None else None
+        # The depth camera sees the top face; the cube centre is half a cube further down.
+        centre_m = None if top_m is None else top_m + CUBE_SIZE_M / 2
+        caption = f"cube {number}"
+        if top_m is not None:
+            caption += f" top {top_m:.3f}m centre {centre_m:.3f}m"
         cv2.polylines(canvas, [pts], True, (0, 255, 0), 2, cv2.LINE_AA)
         cx, cy = pts.mean(axis=0).astype(int)
         cv2.circle(canvas, (int(cx), int(cy)), 3, (0, 0, 255), -1)
-        cv2.putText(canvas, f"id {tag.id}", (int(pts[:, 0].min()), max(int(pts[:, 1].min()) - 6, 14)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
-    cv2.putText(canvas, f"{len(frame.tags)} tag(s)", (8, 20),
+        (text_w, _), _ = cv2.getTextSize(caption, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        text_x = int(min(max(pts[:, 0].min(), 4), canvas.shape[1] - text_w - 4))  # keep the label in view
+        cv2.putText(canvas, caption, (text_x, max(int(pts[:, 1].min()) - 6, 14)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
+        cubes.append((number, top_m, centre_m))
+    cv2.putText(canvas, f"{len(cubes)} cube(s)", (8, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
-    return Image(array=canvas, encoding=rgb.encoding, header=rgb.header)
+    return Image(array=canvas, encoding=rgb.encoding, header=rgb.header), cubes
+
+
+def quat_dot(a, b):
+    return sum(x * y for x, y in zip(a.array(), b.array()))
+
+
+def locate_cube(robot, arm, tag):
+    """Top-face centre (x, y, z) and edge yaw of the cube a tag sits on, in the planning frame."""
+    tp = tag.to_frame(robot.frames, arm.planning_frame)
+    top = tp.apply(Point())
+    yaw = None
+    for axis in (Point(x=1.0), Point(y=1.0)):  # the tag axes lying on the top face
+        p = tp.apply(axis)
+        dx, dy = p.x - top.x, p.y - top.y
+        if math.hypot(dx, dy) > 0.7:
+            yaw = math.atan2(dy, dx)
+            break
+    return (top.x, top.y, top.z), (0.0 if yaw is None else yaw)
+
+
+def average_yaw(yaws):
+    """Mean of cube yaws; cube edges repeat every 90 degrees, so average 4x the angle."""
+    return math.atan2(sum(math.sin(4 * y) for y in yaws), sum(math.cos(4 * y) for y in yaws)) / 4
+
+
+def tool_orientation(azimuth, cube_yaw, pitch, turn):
+    """Tool orientation for a top grasp (same convention as sim_cube_pick.py).
+
+    pitch = 180 deg is straight down; smaller values tilt the tool outward, away from the base
+    (azimuth = direction from the base to the cube), which reaches cubes far from the base.
+    The tool x axis is lined up with a cube edge; `turn` picks one of the four 90-degree equivalents.
+    """
+    k = azimuth - cube_yaw - turn * math.pi / 2
+    return (
+        Quaternion.from_rpy(0.0, 0.0, azimuth)
+        * Quaternion.from_rpy(0.0, pitch, 0.0)
+        * Quaternion.from_rpy(0.0, 0.0, k)
+    )
+
+
+def tool_candidates(x, y, yaw, reference):
+    """(tilt in degrees, orientation) to try, most vertical first; the 2 turns closest to `reference` per tilt."""
+    azimuth = math.atan2(y, x)
+    result = []
+    for pitch_deg in PITCH_CANDIDATES_DEG:
+        options = [tool_orientation(azimuth, yaw, math.radians(pitch_deg), turn) for turn in range(4)]
+        options.sort(key=lambda q: -abs(quat_dot(q, reference)))
+        result.extend((pitch_deg, q) for q in options[:2])
+    return result
+
+
+def move_pose_slow(arm, pose):
+    """move_pose at SPEED, with collision checking first, then without."""
+    last_error = None
+    for check in (True, False):
+        try:
+            arm.move_pose(pose, speed_scaling=SPEED, avoid_obstacles=check)
+            return
+        except Exception as exc:
+            last_error = exc
+    raise last_error
+
+
+def move_straight(arm, x, y, z, orientation):
+    """Straight-line move to (x, y, z) at SPEED; returns the pose."""
+    pose = Pose(position=Point(x=x, y=y, z=z), orientation=orientation)
+    arm.move_linear(pose, speed_scaling=SPEED)
+    return pose
+
+
+def pick_cube(arm, top, yaw, holder):
+    """Hover above the cube, go down, grasp its top face and lift it. Returns (x, y, grasp_z, orientation)."""
+    x, y, top_z = top
+    set_finger_gap(arm, PICK_GAP_M)
+    time.sleep(SETTLE_S)
+
+    last_error = None
+    hover = None
+    for pitch_deg, orientation in tool_candidates(x, y, yaw, arm.pose().orientation):
+        try:
+            hover = Pose(position=Point(x=x, y=y, z=top_z + APPROACH_HEIGHT_M), orientation=orientation)
+            move_pose_slow(arm, hover)
+            print(f"Above the cube with tool tilt {pitch_deg:.0f} deg")
+            break
+        except Exception as exc:
+            last_error = exc
+            hover = None
+    if hover is None:
+        raise RuntimeError(
+            f"Cannot reach a position above the cube at radius {math.hypot(x, y):.3f} m from the base "
+            f"(tried tool tilts {PITCH_CANDIDATES_DEG}): {last_error}"
+        )
+    time.sleep(SETTLE_S)
+
+    grasp_z = None
+    for below in GRASP_BELOW_TOP_M:
+        try:
+            move_straight(arm, x, y, top_z - below, hover.orientation)
+            grasp_z = top_z - below
+            break
+        except Exception as exc:
+            print(f"Cannot lower to {below * 1000:.0f} mm under the cube top: {exc}")
+    if grasp_z is None:
+        raise RuntimeError("Cannot lower onto the cube")
+    time.sleep(SETTLE_S)
+
+    # From here on the cube may be in the gripper, so record it for the put-back in `finally`.
+    holder[:] = [(x, y, grasp_z, hover.orientation)]
+    try:
+        arm.ee.close(timeout=GRIPPER_TIMEOUT_S)  # plain close(): the fingers stop on the cube
+    except OloTimeoutError:
+        print(f"Gripper close timed out; measured finger gap: {(measured_gap(arm) or 0) * 100:.1f} cm")
+    time.sleep(SETTLE_S)
+    move_straight(arm, x, y, grasp_z + LIFT_HEIGHT_M, hover.orientation)
+    time.sleep(SETTLE_S)
+    return x, y, grasp_z, hover.orientation
+
+
+def put_cube_back(arm, x, y, grasp_z, orientation):
+    """Lower the held cube to where it was, let go, and back off straight up."""
+    print("Putting the cube back...")
+    move_straight(arm, x, y, grasp_z + PLACE_CONTACT_GAP_M, orientation)
+    time.sleep(SETTLE_S)
+    set_finger_gap(arm, PICK_GAP_M)  # open, never more than 10 cm
+    time.sleep(SETTLE_S)
+    move_straight(arm, x, y, grasp_z + APPROACH_HEIGHT_M, orientation)
+    time.sleep(SETTLE_S)
 
 
 # ---------------- Main sequence ----------------
 with Client() as client:
     robot = client.robot()
     arm = robot.kinematics
+    held = []  # [(x, y, grasp_z, orientation)] while a cube may be in the gripper
 
     # RULE 1: always start from the initial position.
     print("[1] Initial position")
@@ -197,6 +369,7 @@ with Client() as client:
 
         # ---- detection happens here ----
         rgb_topic = robot.core.topic(RGB_TOPIC, "sensor_msgs/msg/Image")
+        depth_topic = robot.core.topic(DEPTH_TOPIC, "sensor_msgs/msg/Image")
         info_topic = robot.core.topic(CAMERA_INFO_TOPIC, "sensor_msgs/msg/CameraInfo")
         intrinsics = camera_info_to_intrinsics(robot.core.get_latest(info_topic))
         detector = robot.vision.tags(TAG_FAMILY, size_m=MARKER_SIZE_M)
@@ -204,23 +377,47 @@ with Client() as client:
             robot.core.topic(ANNOTATED_TOPIC, "sensor_msgs/msg/Image")
         )
 
-        print(f"Detecting cubes; publishing to {ANNOTATED_TOPIC}. Press Ctrl+C to stop.")
-        last_seen = None
-        try:
-            while True:
-                rgb = robot.core.get_image(rgb_topic)
-                frame = detector.detect(rgb, intrinsics=intrinsics)
-                publisher.publish(annotate(rgb, frame))
-                seen = sorted(t.id for t in frame.tags)
-                if seen != last_seen:
-                    print(f"Cubes seen: {len(seen)} tag(s) {seen}")
-                    last_seen = seen
-                time.sleep(1.0 / MAX_FPS)
-        except KeyboardInterrupt:
-            print("Stopping...")
+        print(f"Detecting cubes ({DETECT_FRAMES} frames); publishing to {ANNOTATED_TOPIC}")
+        positions = []
+        yaws = []
+        for _ in range(DETECT_FRAMES):
+            rgb = robot.core.get_image(rgb_topic)
+            try:
+                depth = robot.core.get_image(depth_topic, timeout=DEPTH_TIMEOUT_S)
+            except OloTimeoutError:
+                depth = None
+            frame = detector.detect(rgb, intrinsics=intrinsics)
+            image, cubes = annotate(rgb, depth, frame)
+            publisher.publish(image)
+            # Cube 1 = the left-most cube in the image, the same numbering as the overlay.
+            posed = [t for t in frame.tags if t.transform is not None]
+            if posed:
+                # With one cube it is the only candidate; with several, the left-most one is picked.
+                first = min(posed, key=lambda t: (np.mean([c.x for c in t.corners]), np.mean([c.y for c in t.corners])))
+                top, yaw = locate_cube(robot, arm, first)
+                positions.append(top)
+                yaws.append(yaw)
+            time.sleep(1.0 / MAX_FPS)
+        if not positions:
+            raise RuntimeError("No cube with a pose was detected; nothing to pick")
+
+        top = tuple(float(np.median([p[i] for p in positions])) for i in range(3))
+        yaw = average_yaw(yaws)
+        print(f"Cube 1 top face at ({top[0]:.3f}, {top[1]:.3f}, {top[2]:.3f}) m, yaw {math.degrees(yaw):+.0f} deg")
+
+        # ---- pick the cube up by its top face, then put it back ----
+        print("[3] Picking cube 1")
+        pick_cube(arm, top, yaw, held)
+        put_cube_back(arm, *held[0])
+        held.clear()
     finally:
         # RULE 4: always return to the initial position, even if a step failed.
-        print("[3] Back to initial position")
+        if held:
+            try:  # do not squeeze the cube shut: put it down and let go first
+                put_cube_back(arm, *held[0])
+            except Exception as exc:
+                print(f"WARNING: could not put the cube back ({exc}); it may still be in the gripper")
+        print("[4] Back to initial position")
         move_to(arm, INITIAL_JOINTS, "initial")
         set_finger_gap(arm, INITIAL_FINGER_GAP_M)
 

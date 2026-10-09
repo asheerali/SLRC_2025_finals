@@ -95,66 +95,62 @@ A run is only complete once the arm is back at the initial position.
   picking and placing the gripper uses plain `open()` / `close()` (the 10 cm gap rule applies only to
   the initial and detection finger states). Rules that still apply there: speed 0.1 on every motion,
   the cap goes back where it was if its box cannot be reached, and Rule 4 (return to initial) always runs.
+- **Cube pick exception (`my_cude_pickup.py` only):** after detection at the detection position, the
+  arm may use `move_pose` (hover above the cube, collision checking first) and `move_linear` (straight
+  up/down only) to pick cube 1 by its top face and put it back where it was. Rules that still apply:
+  `speed_scaling = 0.1` on every motion, the gripper opens to at most 10 cm (Rule 3) and closes with a
+  plain `close()` on the cube only, a held cube is put back and released before the fingers close
+  again, and Rule 4 (return to initial) always runs.
 - Gripper commands wait up to **15 s**. On timeout, the real finger gap is measured and checked against Rule 3 instead of failing blindly.
 - Keep the emergency stop available and the workspace clear before running on real hardware.
 
 ---
 
-## Rule 6 — Visualization and YOLO detection
+## Rule 6 — Cube detection, visualization and pick (ArUco tags)
 
-Detection only runs at the detection position (Rule 2). The camera topics, the YOLO call and the
-annotated output are used like this (see `my_cude_pickup.py`).
+Detection only runs at the detection position (Rule 2). The cubes carry ArUco tags on their faces; the
+tag on the top face is what is detected, drawn and picked (see `my_cude_pickup.py`). YOLO is not used
+for the cubes (its general-purpose model does not recognise them).
 
-**Topics (constants at the top of the script):**
-
-```python
-RGB_TOPIC       = "wrist_rgbd/image"         # input: colour frames (color_image times out in the sim)
-DEPTH_TOPIC     = "wrist_rgbd/depth_image"   # input: depth frames
-ANNOTATED_TOPIC = "wrist_rgbd/annotated"     # output: frames with boxes drawn, for visualization
-CONFIDENCE      = 0.4                        # minimum YOLO score
-MAX_FPS         = 10                         # detection rate limit
-```
-
-All three are `sensor_msgs/msg/Image`.
-
-**Receiving frames:**
-
-- Subscribe to the RGB and depth topics each in its own daemon thread, with `robot.core.subscribe(topic)`.
-- Keep only the latest frame per topic in a `queue.Queue(maxsize=1)` (drop the old one when a new one arrives).
-- Pass thread errors through an `errors` queue and re-raise them in the main loop.
-- Convert each message with `image_message_to_frame(message)`.
-- Start the subscriptions only after the arm is at the detection position.
-
-**Calling YOLO:**
+**Topics and settings (constants at the top of the script):**
 
 ```python
-from olo.ai.yolo import YoloDetector
-
-with client.ai.load_model("yolox_s.onnx") as model:
-    detector = YoloDetector(model)
-    detections = detector.detect(rgb, conf=CONFIDENCE)
+RGB_TOPIC         = "wrist_rgbd/image"          # colour frames (color_image times out in the sim)
+DEPTH_TOPIC       = "wrist_rgbd/depth_image"    # depth frames; if missing, detection runs without depth
+CAMERA_INFO_TOPIC = "wrist_rgbd/camera_info"    # camera intrinsics, needed for the tag pose
+ANNOTATED_TOPIC   = "wrist_rgbd/annotated"      # output: frames with cubes drawn, for the viewer
+TAG_FAMILY        = "aruco_4x4_50"
+MARKER_SIZE_M     = 0.036                       # black marker edge
+CUBE_SIZE_M       = 0.05
 ```
 
-- Each detection has `.label`, `.score` and `.box` (`detection.box.to_xyxy()` gives pixel corners).
-- Wrap `detect` in `try/except` so one bad frame does not stop the run.
-- Run at most `MAX_FPS` frames per second.
+**Detecting:**
 
-**Distance and drawing:**
+```python
+intrinsics = camera_info_to_intrinsics(robot.core.get_latest(info_topic))
+detector   = robot.vision.tags(TAG_FAMILY, size_m=MARKER_SIZE_M)
+frame      = detector.detect(robot.core.get_image(rgb_topic), intrinsics=intrinsics)
+```
 
-- Get the distance with `sample_depth_region(depth, detection.box)` (from `olo.vision`). It raises
-  `ValueError` when there is no valid depth. In that case show the label and score only.
-- Draw with OpenCV on a copy of `rgb.array`: a green rectangle plus the caption `"<label> <score> <depth>m"`.
+- Each tag has `.id`, `.corners` (pixels) and `.transform` (pose, `None` if it could not be solved).
+- Cubes are numbered left to right in the image. Cube 1 is the one that is picked.
+- The cube position is the tag pose in the planning frame, `tag.to_frame(robot.frames, arm.planning_frame)`.
+  Average several frames (`DETECT_FRAMES`) before using it.
+
+**Depth and drawing:**
+
+- Depth of the top face = median of the depth image inside the tag outline (metres; 16-bit images are millimetres).
+  The cube centre is the top depth plus `CUBE_SIZE_M / 2`.
+- Draw with OpenCV on a copy of the RGB image: green tag outline, red centre dot, caption `cube N top .. centre ..`.
 
 **Publishing for visualization:**
 
 ```python
-annotated_topic = robot.core.topic(ANNOTATED_TOPIC, "sensor_msgs/msg/Image")
-publisher = robot.core.publisher(annotated_topic)
-publisher.publish(Image(array=canvas, encoding="bgr8", header=rgb.header))
+publisher = robot.core.publisher(robot.core.topic(ANNOTATED_TOPIC, "sensor_msgs/msg/Image"))
+publisher.publish(Image(array=canvas, encoding=rgb.encoding, header=rgb.header))
 ```
 
-- Publish the annotated frame when there are detections, and the plain RGB frame when there are none.
-- Open `wrist_rgbd/annotated` in the viewer to watch the detections.
+Open `wrist_rgbd/annotated` in the viewer to watch the detections.
 
 ---
 
@@ -165,7 +161,7 @@ publisher.publish(Image(array=canvas, encoding="bgr8", header=rgb.header))
 2. Close fingers to initial state
 3. Move to detection position
 4. Open fingers to 10 cm  (never more than 10 cm)
-5. ── detection happens here (Rule 6: subscribe, run YOLO, publish annotated frames) ──
+5. ── detection happens here (Rule 6: detect tags, publish annotated frames, pick cube 1 and put it back) ──
 6. Move back to initial position
 7. Close fingers to initial state
 ```
